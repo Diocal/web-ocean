@@ -69,7 +69,8 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 export const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+struct P { p: vec4f, q: vec4f, r: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+// r: time (s), rain amount, lightning flash, rain slant
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -102,6 +103,28 @@ fn agxLook(v: vec3f, sat: f32, power: f32) -> vec3f {
   let p = pow(max(v, vec3f(0.0)), vec3f(power));
   return l + sat * (p - l);
 }
+fn hash21(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
+
+// wind-slanted rain streaks in three depth layers (screen space)
+fn rain(uv: vec2f, aspect: f32) -> f32 {
+  var r = 0.0;
+  for (var l = 0; l < 3; l++) {
+    let fl = f32(l);
+    let scale = 34.0 + fl * 26.0;
+    var p = vec2f(uv.x * aspect, uv.y) * vec2f(scale, scale * 0.11);
+    p.x += p.y * U.r.w * 9.0;
+    p.y -= U.r.x * (2.4 + fl * 0.9);
+    let cell = floor(p);
+    let f = fract(p);
+    let h = hash21(cell + fl * 17.0);
+    let x = 0.15 + 0.7 * hash21(cell.yx * 1.7 + fl);
+    let len = 0.35 + 0.4 * h;
+    let streak = (1.0 - smoothstep(0.0, 0.05 + fl * 0.02, abs(f.x - x))) * smoothstep(0.0, 0.1, f.y) * (1.0 - smoothstep(len - 0.1, len, f.y));
+    r += streak * step(h, 0.55) * (0.5 - fl * 0.12);
+  }
+  return r;
+}
+
 fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
 
 @fragment fn fs(in: VO) -> @location(0) vec4f {
@@ -111,6 +134,14 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   // the up-chain accumulates 8 blur levels
   let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * (1.0 / 8.0);
   c = mix(c, b, U.p.y);
+  // lightning flash lights everything with cold light; rain veils and streaks the view
+  let lumIn = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  c += vec3f(0.55, 0.62, 0.8) * U.r.z * (0.35 + 1.5 * lumIn);
+  if (U.r.y > 0.0) {
+    let veil = vec3f(lumIn * 0.6 + 0.02) * vec3f(0.85, 0.9, 1.0);
+    c = mix(c, veil, 0.18 * U.r.y);
+    c += vec3f(0.06, 0.065, 0.075) * (0.6 + lumIn * 2.0 + U.r.z * 4.0) * rain(in.uv, dims.x / dims.y) * U.r.y;
+  }
   c *= U.p.x;
   // subtle vignette
   let d = (in.uv - 0.5) * vec2f(dims.x / dims.y, 1.0);

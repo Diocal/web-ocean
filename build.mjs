@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
+const wgslModules = ['js/wgsl/common.js', 'js/wgsl/boat.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
 const order = [...wgslModules, 'js/main.js'];
 const stripModuleSyntax = (src) => src
   .replace(/^import[\s\S]*?from\s+['"][^'"]+['"];\s*$/gm, '')                 // drop imports

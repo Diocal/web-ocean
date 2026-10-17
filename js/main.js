@@ -5,7 +5,8 @@
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
-import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
+import { OCEAN, SKY_BG, HEIGHT_PROBE, SHIP_RENDER } from './wgsl/ocean.js';
+import { SHIP_SIM, SHIP_TYPES, MAX_SHIPS, buildShip } from './wgsl/boat.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 
 const qs = new URLSearchParams(location.search);
@@ -35,6 +36,26 @@ export const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
+  boatSpeed: 3.0,      // m/s through the water (the sloop; the galleons keep station)
+  overcast: 0.0,       // storm: grey sky, hidden sun
+  rain: 0.0,
+  lightning: 0.0,      // strikes per ~8 s
+  rogueHeight: 32,     // m crest to trough
+};
+// Scene presets: the original sunset; "after the storm" (default): a huge leftover sea under
+// a low golden sun breaking through the clouds, with rogue waves; and a full storm.
+const SCENES = {
+  sunset: { ...P },
+  swell: {
+    ...P, windSpeed: 14, fetchKm: 400, swellHs: 4.2, swellDir: 104, swellLength: 170, swellSpread: 30, choppy: 1.05,
+    turbidity: 1.2, foam: 1.3, sunElev: 3.2, sunAzim: 4, exposure: 1.45, haze: 4.5, clouds: 0.62, veil: 0.5, bloom: 0.12,
+    overcast: 0.12, rain: 0, lightning: 0,
+  },
+  storm: {
+    ...P, windSpeed: 16, fetchKm: 400, swellHs: 4.0, swellDir: 104, swellLength: 170, swellSpread: 30, choppy: 1.05,
+    turbidity: 0.9, foam: 1.5, sunElev: 4.0, exposure: 1.9, haze: 7.0, clouds: 0.95, veil: 0.95, bloom: 0.14,
+    overcast: 0.8, rain: 0.8, lightning: 1.0,
+  },
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -123,7 +144,7 @@ async function main() {
   const fullArr = (t) => t.createView({ dimension: '2d-array' });
 
   const [initPipe, evolvePipe, rowsPipe, colsPipe, simMipPipe, foamGenPipe, rgba8MipPipe,
-    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe] = await Promise.all([
+    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe, shipSimPipe] = await Promise.all([
     computePipe(SIM_INIT, 'sim init'),
     computePipe(SIM_EVOLVE, 'sim evolve'),
     computePipe(FFT_ROWS, 'fft rows'),
@@ -139,6 +160,7 @@ async function main() {
     computePipe(FOAM_UPDATE, 'foam update'),
     computePipe(ARRAY16_MIPS, 'array16 mips'),
     computePipe(SUN_VIS, 'sun visibility'),
+    computePipe(SHIP_SIM, 'ship sim'),
   ]);
 
   const bg = (pipe, entries, label) => device.createBindGroup({
@@ -195,8 +217,14 @@ async function main() {
   const samplerSim = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat',
   });
+  // Ships: poses (buoyancy) are simulated on the GPU and stay there
+  const frameUBO = mkBuf(448, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const shipBuf = mkBuf(144 * MAX_SHIPS, GU.STORAGE, 'ship state');
+  const shipUBO = mkBuf(320, GU.UNIFORM | GU.COPY_DST, 'ship ubo');
+  const shipF = new Float32Array(80);
+  const bgShipSim = bg(shipSimPipe, [{ buffer: shipUBO }, fullArr(dispTex), samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'ship sim');
   const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
-    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim], 'foamupd' + i));
+    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'foamupd' + i));
   const bgFoamMips = [0, 1].map((i) => {
     const out = [];
     for (let m = 1; m < FOAMW_MIPS; m++) out.push(bg(arr16MipPipe, [lvl(foamW[i], m - 1), lvl(foamW[i], m)]));
@@ -226,7 +254,6 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
@@ -245,9 +272,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, shipMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(SHIP_RENDER, 'ships'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -256,6 +283,18 @@ async function main() {
       buffers: [{ arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }],
     },
     fragment: { module: oceanMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const shipPipe = await device.createRenderPipelineAsync({
+    label: 'ships', layout: 'auto',
+    vertex: {
+      module: shipMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 32, attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' }, { shaderLocation: 1, offset: 16, format: 'float32x4' }] }],
+    },
+    fragment: { module: shipMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
@@ -289,7 +328,17 @@ async function main() {
 
   const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+    fullArr(foamW[i]), { buffer: sunVisBuf }, { buffer: shipBuf }], 'ocean' + i));
+  const bgShip = bg(shipPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, envCubeView,
+    { buffer: shipBuf }, { buffer: sunVisBuf }], 'ships');
+  const shipMeshes = SHIP_TYPES.map((_, t) => {
+    const m = buildShip(t);
+    const vb = mkBuf(m.verts.byteLength, GU.VERTEX | GU.COPY_DST, 'ship vertices ' + t);
+    const ib = mkBuf(m.idx.byteLength, GU.INDEX | GU.COPY_DST, 'ship indices ' + t);
+    device.queue.writeBuffer(vb, 0, m.verts);
+    device.queue.writeBuffer(ib, 0, m.idx);
+    return { vb, ib, count: m.idx.length };
+  });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
@@ -334,8 +383,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const BLOOM_LEVELS = 8;
   const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-  const compUBO = mkBuf(32, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
-  const compData = new Float32Array(8);
+  const compUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
+  const compData = new Float32Array(12);
   const bloomUBOs = [];
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
@@ -418,7 +467,7 @@ async function main() {
   // Uniform data
   // --------------------------------------------------------------------------------------
   const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const frameF = new Float32Array(112);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -485,13 +534,196 @@ async function main() {
   }
 
   // --------------------------------------------------------------------------------------
+  // Fleet: the sloop sails a wide circle across the start view with two pirate galleons in
+  // pursuit (the flagship under black sails). Fore-and-aft sails go to leeward, square sails
+  // are braced to the wind, flags stream downwind. ?ships=0 removes them.
+  // --------------------------------------------------------------------------------------
+  const FLEET = [
+    { type: 0, sail: 0, r: 220, dth: 0, heel: 7 },
+    { type: 1, sail: 1, r: 250, dth: -0.13, heel: 3 },
+    { type: 1, sail: 0, r: 285, dth: -0.30, heel: 3 },
+  ].slice(0, qs.get('ships') === '0' ? 0 : MAX_SHIPS);
+  const fleet = { cx: 0, cz: -330, theta: Math.PI / 2 - 0.10, reset: 1 };
+  if (qs.get('boatAt')) fleet.theta = Number(qs.get('boatAt')) * D2R;
+  for (const sh of FLEET) { sh.side = 0; sh.brace = 0; }
+  function updateFleet(dt) {
+    const omega = P.boatSpeed / 220;
+    fleet.theta += omega * dt;
+    const wx = Math.cos(P.windDir * D2R), wz = Math.sin(P.windDir * D2R);
+    shipF.fill(0);
+    FLEET.forEach((sh, i) => {
+      const th = fleet.theta + sh.dth;
+      const head = th + Math.PI;
+      const fx = Math.sin(head), fz = -Math.cos(head), rx = Math.cos(head), rz = Math.sin(head);
+      // wind direction relative to the bow (positive = blowing towards starboard)
+      const rel = Math.atan2(wx * rx + wz * rz, wx * fx + wz * fz);
+      const lee = rel >= 0 ? 1 : -1;
+      if (!sh.side) sh.side = lee;
+      sh.side += (lee - sh.side) * Math.min(1, dt * 0.6);
+      const braceT = Math.max(-0.55, Math.min(0.55, Math.abs(rel) > Math.PI / 2 ? rel - Math.PI * lee : rel));
+      sh.brace += (braceT - sh.brace) * Math.min(1, dt * 0.5);
+      const o = i * 16;
+      shipF[o] = fleet.cx + sh.r * Math.cos(th); shipF[o + 1] = fleet.cz + sh.r * Math.sin(th);
+      sh.x = shipF[o]; sh.z = shipF[o + 1]; sh.head = head;
+      shipF[o + 2] = head; shipF[o + 3] = omega * sh.r;
+      shipF[o + 4] = dt;
+      shipF[o + 5] = sh.heel * D2R * sh.side * Math.min(1, P.boatSpeed / 3) * Math.min(1.5, P.windSpeed / 7);
+      shipF[o + 6] = sh.side; shipF[o + 7] = fleet.reset;
+      shipF[o + 8] = sh.type; shipF[o + 9] = sh.sail; shipF[o + 10] = 1; shipF[o + 11] = sh.brace;
+      shipF[o + 12] = rel + Math.PI;
+    });
+    for (let c = 0; c < C; c++) { shipF[64 + c] = CASC_L[c]; shipF[72 + c] = 1 / CASC_L[c]; }
+    fleet.reset = 0;
+    device.queue.writeBuffer(shipUBO, 0, shipF);
+  }
+
+  // --------------------------------------------------------------------------------------
+  // Filming: ?rec=seconds&name=take.webm records the canvas (after ?warm seconds) and posts
+  // it to the dev server. The camera can glide from cam= to cam2=, or ride along with ship
+  // follow=i at off=right,up,forward,yawDeg,pitchDeg (gliding to off2=).
+  // --------------------------------------------------------------------------------------
+  // ?film=frames&fdt=1/30&name=take renders an exact frame sequence instead (fixed time step,
+  // each frame read back and posted as name_00000.jpg); the camera moves over the frames.
+  const filmN = Number(qs.get('film')) || 0;
+  const film = { idx: 0, t: 0 };
+  const recSecs = Number(qs.get('rec')) || 0;
+  const recWarm = qs.has('warm') ? Number(qs.get('warm')) : 3;
+  const rec = { state: recSecs ? 'warm' : 'off', t: 0, recorder: null, chunks: [] };
+  const vec = (k) => (qs.get(k) ? qs.get(k).split(',').map(Number) : null);
+  const cam1 = vec('cam'), cam2 = vec('cam2'), off1 = vec('off'), off2 = vec('off2');
+  const followIdx = qs.has('follow') ? Number(qs.get('follow')) : -1;
+  function updateRec(dt) {
+    if (rec.state === 'off' || rec.state === 'done') return;
+    rec.t += dt;
+    if (rec.state === 'warm' && rec.t >= recWarm) {
+      const rcd = new MediaRecorder(canvas.captureStream(60), { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 60e6 });
+      rcd.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
+      rcd.onstop = async () => {
+        const name = qs.get('name') || 'take.webm';
+        await fetch('/__shot?name=' + encodeURIComponent(name), { method: 'POST', body: new Blob(rec.chunks, { type: 'video/webm' }) });
+        log('rec saved ' + name);
+        document.title = 'REC DONE';
+      };
+      rcd.start(1000);
+      rec.recorder = rcd; rec.state = 'rec'; rec.t = 0;
+    } else if (rec.state === 'rec' && rec.t >= recSecs) {
+      rec.recorder.stop();
+      rec.state = 'done';
+    }
+  }
+  function directCamera() {
+    if (!cam2 && followIdx < 0) return;
+    const x = filmN ? Math.min(1, film.idx / filmN) : rec.state === 'rec' ? Math.min(1, rec.t / recSecs) : rec.state === 'done' ? 1 : 0;
+    const k = x * x * (3 - 2 * x);
+    const mix = (a, b) => (b ? a.map((v, i) => v + (b[i] - v) * k) : a);
+    if (followIdx >= 0 && FLEET[followIdx] && off1) {
+      const sh = FLEET[followIdx], o = mix(off1, off2);
+      const rx = Math.cos(sh.head), rz = Math.sin(sh.head), fx = Math.sin(sh.head), fz = -Math.cos(sh.head);
+      cam.x = sh.x + rx * o[0] + fx * o[2]; cam.z = sh.z + rz * o[0] + fz * o[2];
+      cam.y = Math.max(o[1], waterH + 0.9);
+      cam.yaw = sh.head + (o[3] || 0) * D2R; cam.pitch = (o[4] || 0) * D2R;
+    } else if (cam1 && cam2) {
+      const c = mix(cam1, cam2);
+      cam.x = c[0]; cam.z = c[2]; cam.y = Math.max(c[1], waterH + 0.9);
+      cam.yaw = c[3] * D2R; cam.pitch = c[4] * D2R;
+    }
+  }
+
+  // --------------------------------------------------------------------------------------
+  // Rogue wave: a 200 m long, steep wave group that runs downwind across the camera's
+  // position (G, the panel button, or every ~50 s in the storm).
+  // --------------------------------------------------------------------------------------
+  let sceneName = 'swell';
+  const ROGUE_L = 180, ROGUE_K = 2 * Math.PI / ROGUE_L, ROGUE_C = Math.sqrt(9.81 / ROGUE_K);
+  const rogue = { on: false, u: 0, amp: 0, ox: 0, oz: 0, dx: 0, dz: 1, wait: 8 };
+  function triggerRogue() {
+    rogue.on = true; rogue.u = -480;
+    rogue.dx = Math.cos(P.windDir * D2R); rogue.dz = Math.sin(P.windDir * D2R);
+    rogue.ox = cam.x; rogue.oz = cam.z;
+  }
+  function updateRogue(dt) {
+    if (!rogue.on) {
+      rogue.amp = 0;
+      if (sceneName !== 'sunset' && P.rogueHeight > 0) { rogue.wait -= dt; if (rogue.wait <= 0) triggerRogue(); }
+      return;
+    }
+    rogue.u += ROGUE_C * dt;
+    const fade = Math.min(1, (rogue.u + 480) / 120) * Math.min(1, Math.max(0, (450 - rogue.u) / 200));
+    rogue.amp = P.rogueHeight / 1.6 * fade;
+    if (rogue.u > 450) { rogue.on = false; rogue.wait = 50; }
+  }
+  // ?rogueU=-150: start a rogue wave that far from the camera (once the camera is placed)
+  let pendingRogueU = qs.has('rogueU') ? Number(qs.get('rogueU')) : null;
+
+  // --------------------------------------------------------------------------------------
+  // Lightning (and thunder, once audio is allowed)
+  // --------------------------------------------------------------------------------------
+  const strike = { t: 99, next: 3, az: 0 };
+  function updateLightning(dt) {
+    strike.t += dt;
+    if (P.lightning > 0) {
+      strike.next -= dt * P.lightning;
+      if (strike.next <= 0) {
+        strike.t = 0; strike.next = 4 + Math.random() * 9;
+        strike.az = cam.yaw + (Math.random() - 0.5) * 1.6;
+        thunder(0.6 + Math.random() * 2.5);
+      }
+    }
+    const t = strike.t;
+    return t < 1.2 ? Math.exp(-t * 6) * (0.55 + 0.45 * Math.cos(t * 60)) : 0;
+  }
+
+  // procedural storm audio: wind, rain and surf noise beds plus thunder
+  let audio = null;
+  function initAudio() {
+    if (audio) return;
+    try {
+      const ac = new AudioContext();
+      const len = ac.sampleRate * 2;
+      const buf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = buf.getChannelData(0);
+      let b = 0;
+      for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; b = (b + 0.02 * w) / 1.02; d[i] = w * 0.5 + b * 6; }
+      const bed = (type, freq, q) => {
+        const src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+        const f = ac.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+        const g = ac.createGain(); g.gain.value = 0;
+        src.connect(f).connect(g).connect(ac.destination); src.start();
+        return g;
+      };
+      audio = { ac, buf, wind: bed('bandpass', 420, 0.5), rain: bed('highpass', 2600, 0.4), surf: bed('lowpass', 260, 0.7) };
+    } catch (e) { audio = false; }
+  }
+  addEventListener('pointerdown', initAudio);
+  addEventListener('keydown', initAudio);
+  function thunder(delay) {
+    if (!audio) return;
+    const { ac, buf } = audio;
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 180 + Math.random() * 200;
+    const g = ac.createGain();
+    const t0 = ac.currentTime + delay;
+    g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.9, t0 + 0.08);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 4.5);
+    src.connect(f).connect(g).connect(ac.destination); src.start(t0); src.stop(t0 + 5);
+  }
+  function updateAudio(dt) {
+    if (!audio) return;
+    const k = Math.min(1, dt * 2);
+    const gust = 0.8 + 0.2 * Math.sin(performance.now() * 0.0007) * Math.sin(performance.now() * 0.0013);
+    audio.wind.gain.value += (Math.min(0.5, P.windSpeed * P.windSpeed / 700) * gust - audio.wind.gain.value) * k;
+    audio.rain.gain.value += (P.rain * 0.12 - audio.rain.gain.value) * k;
+    audio.surf.gain.value += ((0.1 + P.swellHs * 0.05 + rogue.amp * 0.02) - audio.surf.gain.value) * k;
+  }
+
+  // --------------------------------------------------------------------------------------
   // CDLOD node selection (CPU, allocation free)
   // --------------------------------------------------------------------------------------
   const ranges = new Float64Array(LODS);
   for (let l = 0; l < LODS; l++) ranges[l] = R0 * Math.pow(2, l);
   const planes = new Float64Array(16);
-  const HB = 4.0;   // vertical bound of displaced surface
-  const XB = 4.0;   // horizontal displacement margin for culling
+  let HB = 4.0;   // vertical bound of displaced surface
+  let XB = 4.0;   // horizontal displacement margin for culling
   let nodeCount = 0, ccx = 0, ccy = 0, ccz = 0;
 
   function sphereHit(x0, z0, size, r) {
@@ -532,6 +764,9 @@ async function main() {
   }
   function selectAll() {
     nodeCount = 0;
+    const sea = 0.9 * P.swellHs + 0.012 * P.windSpeed * P.windSpeed;
+    HB = 4 + sea + rogue.amp * 1.05;
+    XB = 4 + 0.6 * sea + rogue.amp * 1.8;
     ccx = cam.x; ccy = cam.y; ccz = cam.z;
     // side planes from the camera-relative view-projection (rows 3±0, 3±1)
     const m = viewProj;
@@ -555,6 +790,7 @@ async function main() {
   // Per-frame uniforms
   // --------------------------------------------------------------------------------------
   let simTime = Number(qs.get('t')) || 0;
+  let flash = 0;
   let frameIndex = 0;
 
   function writeFrame(time) {
@@ -596,6 +832,11 @@ async function main() {
     f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
     f[91] = 1.1e-4;
     f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    f[96] = rogue.dx; f[97] = rogue.dz; f[98] = rogue.u; f[99] = rogue.amp;
+    f[100] = rogue.ox; f[101] = rogue.oz; f[102] = ROGUE_K;
+    f[103] = Math.min(1.6, 0.68 / Math.max(ROGUE_K * rogue.amp, 1e-3));
+    f[104] = 120; f[105] = 520;
+    f[108] = flash; f[109] = strike.az; f[110] = P.overcast; f[111] = P.rain;
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -605,10 +846,10 @@ async function main() {
   const panel = document.getElementById('panel');
   function togglePanel() { panel.classList.toggle('hidden'); }
   const SLIDERS = [
-    ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
+    ['windSpeed', 'Wind speed (m/s)', 2, 25, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
     ['fetchKm', 'Fetch (km)', 5, 800, 1, 'spec'],
-    ['swellHs', 'Swell height (m)', 0, 4, 0.05, 'spec'],
+    ['swellHs', 'Swell height (m)', 0, 8, 0.05, 'spec'],
     ['swellLength', 'Swell wavelength (m)', 30, 300, 1, 'spec'],
     ['swellDir', 'Swell direction (deg)', 0, 360, 1, 'spec'],
     ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
@@ -621,7 +862,22 @@ async function main() {
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
+    ['boatSpeed', 'Boat speed (m/s)', 0, 8, 0.1, ''],
+    ['overcast', 'Storm overcast', 0, 1, 0.01, ''],
+    ['rain', 'Rain', 0, 1, 0.01, ''],
+    ['lightning', 'Lightning', 0, 3, 0.01, ''],
+    ['rogueHeight', 'Rogue wave (m)', 0, 35, 0.5, ''],
   ];
+  // scene and event buttons
+  const btnRow = document.createElement('div');
+  btnRow.className = 'btns';
+  const mkBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; btnRow.appendChild(b); };
+  mkBtn('After storm', () => applyScene('swell'));
+  mkBtn('Storm', () => applyScene('storm'));
+  mkBtn('Sunset', () => applyScene('sunset'));
+  mkBtn('Rogue wave (G)', () => triggerRogue());
+  panel.appendChild(btnRow);
+  const inputs = {};
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
     const name = document.createElement('span'); name.textContent = label;
@@ -636,7 +892,20 @@ async function main() {
     });
     row.append(name, inp, val);
     panel.appendChild(row);
+    inputs[key] = [inp, val];
   }
+  sceneName = 'swell';
+  function applyScene(name) {
+    sceneName = name;
+    Object.assign(P, SCENES[name]);
+    for (const k in inputs) { inputs[k][0].value = P[k]; inputs[k][1].textContent = String(P[k]); }
+    needSpectrum = true; needLUT = true; envFull = 2;
+  }
+  addEventListener('keydown', (e) => {
+    if (e.code === 'KeyG') triggerRogue();
+    if (e.code === 'KeyT') applyScene({ swell: 'storm', storm: 'sunset', sunset: 'swell' }[sceneName]);
+  });
+  applyScene(SCENES[qs.get('scene')] ? qs.get('scene') : 'swell');
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
@@ -650,7 +919,7 @@ async function main() {
   const shotFrames = Number(qs.get('frames')) || 240;
   const shotSeq = Number(qs.get('seq')) || 1;
   let shotIdx = 0;
-  const fixedDt = shotName ? 1 / 60 : 0;
+  const fixedDt = filmN ? Number(qs.get('fdt')) || 1 / 30 : shotName ? 1 / 60 : 0;
   let last = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
@@ -670,6 +939,12 @@ async function main() {
       const s = N >> m;
       cp.setBindGroup(0, bgSimMips[m - 1]);
       cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), C);
+    }
+    // ship poses (read by the foam update and the render passes below)
+    if (FLEET.length) {
+      cp.setPipeline(shipSimPipe);
+      cp.setBindGroup(0, bgShipSim);
+      cp.dispatchWorkgroups(MAX_SHIPS);
     }
     // foam clipmaps
     foamCur = 1 - foamCur;
@@ -729,6 +1004,13 @@ async function main() {
     simF[52] = simTime; simF[53] = dt;
     device.queue.writeBuffer(simUBO, 0, simF);
     writeFoamUniforms(dt);
+    updateFleet(dt);
+    updateRec(dt);
+    directCamera();
+    if (pendingRogueU !== null) { triggerRogue(); rogue.u = pendingRogueU; pendingRogueU = null; }
+    updateRogue(dt);
+    flash = updateLightning(dt);
+    updateAudio(dt);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -782,6 +1064,16 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    if (FLEET.length) {
+      rp.setPipeline(shipPipe);
+      rp.setBindGroup(0, bgShip);
+      FLEET.forEach((sh, i) => {
+        const m = shipMeshes[sh.type];
+        rp.setVertexBuffer(0, m.vb);
+        rp.setIndexBuffer(m.ib, 'uint32');
+        rp.drawIndexed(m.count, 1, 0, 0, i);
+      });
+    }
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -804,6 +1096,8 @@ async function main() {
 
     compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
     compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 0;
+    compData[8] = simTime; compData[9] = P.rain; compData[10] = flash * (0.4 + 0.6 * P.overcast);
+    compData[11] = -Math.sin(P.windDir * D2R - cam.yaw) * 0.12 * Math.min(1, P.windSpeed / 15);
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
@@ -814,7 +1108,7 @@ async function main() {
     pc.end();
 
     let doProbe = false;
-    if (!probePending && (frameIndex & 7) === 0) {
+    if (!probePending && ((frameIndex & 7) === 0 || filmN)) {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
       doProbe = true;
     }
@@ -823,6 +1117,13 @@ async function main() {
       enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
       enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
       doTs = true;
+    }
+    let filmBuf = null;
+    film.t += dt;
+    if (filmN && film.idx < filmN && film.t >= recWarm) {
+      shooting = true;
+      filmBuf = device.createBuffer({ size: Math.ceil(W * 4 / 256) * 256 * H, usage: GU.MAP_READ | GU.COPY_DST });
+      enc.copyTextureToBuffer({ texture: swapTex }, { buffer: filmBuf, bytesPerRow: Math.ceil(W * 4 / 256) * 256 }, [W, H]);
     }
     let readBuf = null;
     if (shotName && shotIdx < shotSeq && frameIndex >= shotFrames + shotIdx) {
@@ -837,6 +1138,31 @@ async function main() {
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
+    if (filmBuf) saveFilm(filmBuf, Math.ceil(W * 4 / 256) * 256);
+  }
+
+  async function saveFilm(buf, bpr) {
+    await buf.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buf.getMappedRange());
+    const img = new ImageData(W, H);
+    const d = img.data, bgra = swapFormat === 'bgra8unorm';
+    for (let y = 0; y < H; y++) {
+      for (let x = 0, s0 = y * bpr, d0 = y * W * 4; x < W; x++, s0 += 4, d0 += 4) {
+        d[d0] = src[s0 + (bgra ? 2 : 0)]; d[d0 + 1] = src[s0 + 1]; d[d0 + 2] = src[s0 + (bgra ? 0 : 2)]; d[d0 + 3] = 255;
+      }
+    }
+    buf.unmap();
+    buf.destroy();
+    const oc = new OffscreenCanvas(W, H);
+    oc.getContext('2d').putImageData(img, 0, 0);
+    const blob = await oc.convertToBlob({ type: 'image/jpeg', quality: 0.94 });
+    const name = (qs.get('name') || 'film') + '_' + String(film.idx).padStart(5, '0') + '.jpg';
+    await fetch('/__shot?name=' + encodeURIComponent(name), { method: 'POST', body: blob });
+    film.idx++;
+    shooting = false;
+    if (film.idx < filmN) { requestAnimationFrame(frame); return; }
+    log('film done ' + (qs.get('name') || 'film') + ' ' + filmN + ' frames');
+    document.title = 'FILM DONE';
   }
 
   async function saveShot(buf, bpr, go) {

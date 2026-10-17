@@ -16,6 +16,9 @@
   #panel label { display: grid; grid-template-columns: 1fr 110px 40px; gap: 6px; align-items: center; margin: 3px 0; }
   #panel input { width: 110px; accent-color: #e2a04e; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
+  #panel .btns { display: flex; gap: 6px; margin: 2px 0 8px; }
+  #panel button { flex: 1; padding: 5px 4px; border: 1px solid #e2a04e66; border-radius: 5px; background: #e2a04e22; color: #e5e1d8; font: 12px system-ui, sans-serif; cursor: pointer; }
+  #panel button:hover { background: #e2a04e44; }
   #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
 </style>
 </head>
@@ -23,7 +26,7 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
+  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel · G rogue wave · T scene</div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>

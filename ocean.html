@@ -16,6 +16,9 @@
   #panel label { display: grid; grid-template-columns: 1fr 110px 40px; gap: 6px; align-items: center; margin: 3px 0; }
   #panel input { width: 110px; accent-color: #e2a04e; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
+  #panel .btns { display: flex; gap: 6px; margin: 2px 0 8px; }
+  #panel button { flex: 1; padding: 5px 4px; border: 1px solid #e2a04e66; border-radius: 5px; background: #e2a04e22; color: #e5e1d8; font: 12px system-ui, sans-serif; cursor: pointer; }
+  #panel button:hover { background: #e2a04e44; }
   #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
 </style>
 </head>
@@ -23,7 +26,7 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
+  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel · G rogue wave · T scene</div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>
@@ -60,7 +63,51 @@ struct Frame {
   foamP:    vec4f,     // J threshold, J gain, foam intensity, lace sharpness
   fogExt:   vec4f,     // rgb extinction per metre near sea level
   cloudP:   vec4f,     // altitude km, coverage, optical density, wind time
+  rogueA:   vec4f,     // rogue wave: travel direction xy (unit), crest position along it (m), amplitude (m)
+  rogueB:   vec4f,     // origin xy, wavenumber, Gerstner steepness Q
+  rogueC:   vec4f,     // group length along travel (m), crest length (m), -, -
+  storm:    vec4f,     // lightning flash, bolt azimuth (rad), overcast, rain
 };
+`;
+
+// Rogue wave: a single steep Gerstner wave group (one giant crest between deep troughs)
+// added on top of the FFT sea. Returns displacement, slope and Jacobian terms in the same
+// (lagrangian) form as the FFT textures. Requires FRAME_WGSL and a 'F: Frame' binding.
+const ROGUE_WGSL = /* wgsl */ `
+struct Rogue { d: vec3f, s: vec2f, jxx: f32, jzz: f32, jxz: f32 };
+fn rogueAt(x0: vec2f) -> Rogue {
+  var r: Rogue;
+  let A = F.rogueA.w;
+  if (A <= 0.0) { return r; }
+  let dir = F.rogueA.xy;
+  let perp = vec2f(-dir.y, dir.x);
+  let q = x0 - F.rogueB.xy;
+  let u = dot(q, dir) - F.rogueA.z;
+  let v = dot(q, perp);
+  let sw = F.rogueC.x;
+  let lw = F.rogueC.y;
+  let env = A * exp(-(u * u) / (sw * sw) - (v * v) / (lw * lw));
+  if (env < 1e-3) { return r; }
+  let envU = env * (-2.0 * u / (sw * sw));
+  let envV = env * (-2.0 * v / (lw * lw));
+  let k = F.rogueB.z;
+  let Q = F.rogueB.w;
+  let c = cos(k * u);
+  let sn = sin(k * u);
+  let hx = -Q * env * sn;
+  let hU = envU * c - env * k * sn;
+  let hV = envV * c;
+  let hxU = -Q * (envU * sn + env * k * c);
+  let hxV = -Q * envV * sn;
+  r.d = vec3f(dir.x * hx, env * c, dir.y * hx);
+  r.s = vec2f(hU * dir.x + hV * perp.x, hU * dir.y + hV * perp.y);
+  let gx = hxU * dir.x + hxV * perp.x;
+  let gz = hxU * dir.y + hxV * perp.y;
+  r.jxx = dir.x * gx;
+  r.jzz = dir.y * gz;
+  r.jxz = 0.5 * (dir.x * gz + dir.y * gx);
+  return r;
+}
 `;
 
 const ATMO_CORE_WGSL = /* wgsl */ `
@@ -196,8 +243,585 @@ fn pfbm(p: vec2f, period: i32, oct: i32) -> f32 {
 }
 `;
 
+// ---- js/wgsl/boat.js ----
+// Ships: a 10 m sloop and a 30 m pirate galleon. Procedural geometry plus the WGSL shared
+// with the ocean. Hulls are analytic (one parameter set per type), so the mesh, the water
+// clipped inside the hull, the buoyancy samples and the reflection/shadow rays on the water
+// all agree on one shape.
+// Ship-local frame: x = starboard, y = up (0 = design waterline), z = towards the bow.
+
+const MAX_SHIPS = 4;
+
+// Hull parameters. Stations s run from -1 (transom) to +1 (stem).
+const SHIP_TYPES = [
+  { // 0: 10 m sloop
+    L: 10, B: 3.3, deck0: 0.95, sheerF: 0.30, sheerA: 0.06, castleA: 0, castleF: 0, draft: 0.62, keelF: 0.25,
+    keelA: 0.08, transom: 0.3, entry: 2.2, pAft: 0.30, pFwd: 0.65, tumble: 0, bulwark: 0, cabin: 1,
+  },
+  { // 1: 30 m galleon: deep U-shaped hull, tumblehome, high sterncastle and forecastle
+    L: 30, B: 8.4, deck0: 2.7, sheerF: 1.0, sheerA: 0.5, castleA: 2.6, castleF: 1.4, draft: 3.0, keelF: 1.4,
+    keelA: 0.9, transom: 0.42, entry: 1.7, pAft: 0.42, pFwd: 0.55, tumble: 0.16, bulwark: 1.0, cabin: 0,
+  },
+];
+const SHAPE_KEYS = ['L', 'B', 'deck0', 'sheerF', 'sheerA', 'castleA', 'castleF', 'draft', 'keelF', 'keelA',
+  'transom', 'entry', 'pAft', 'pFwd', 'tumble', 'bulwark', 'cabin'];
+
+// ---- hull shape (mirrored in SHIP_SHAPE_WGSL) -------------------------------------------
+const clamp01 = (x) => Math.min(1, Math.max(0, x));
+const sstep = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const topY = (h, s) => {
+  const f = Math.max(s, 0), a = Math.min(s, 0);
+  return h.deck0 + h.sheerF * f * f + h.sheerA * a * a + h.castleA * (1 - sstep(-0.78, -0.5, s)) + h.castleF * sstep(0.62, 0.82, s);
+};
+const keelY = (h, s) => -h.draft * Math.pow(Math.max(1 - s * s, 0), 0.55) + h.keelF * sstep(0.55, 1, s) + h.keelA * (1 - sstep(-1, -0.6, s));
+const halfBeam = (h, s) => (s > 0 ? Math.pow(Math.max(1 - Math.pow(s, h.entry), 0), 0.55) : 1 - h.transom * s * s) * 0.5 * h.B;
+const secPow = (h, s) => h.pAft + (h.pFwd - h.pAft) * sstep(-0.2, 1, s);
+const hullHalfW = (h, s, y) => {
+  const yk = keelY(h, s), t = clamp01((y - yk) / (topY(h, s) - yk));
+  return halfBeam(h, s) * Math.pow(t, secPow(h, s)) * (1 - h.tumble * sstep(0.55, 1, t));
+};
+const walkY = (h, s) => topY(h, s) - h.bulwark;
+// stations crowd towards the bow, where the hull curves fastest
+const station = (u) => -1 + 2 * (1 - Math.pow(1 - u, 1.5));
+
+// sloop cabin trunk
+const CAB_S0 = -0.40, CAB_S1 = 0.28;
+const SLOOP = SHIP_TYPES[0];
+const cabinTop = (s) => topY(SLOOP, s) + 0.58 - 0.30 * sstep(0.12, CAB_S1, s);
+const cabinHalfW = (s) => 0.62 * halfBeam(SLOOP, s);
+
+const lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+// ---- sloop rig --------------------------------------------------------------------------
+const MAST_S = 0.24, MAST_H = 13.5, BOOM_H = 1.05, BOOM_LEN = 4.3, BOOM_ANG = 0.32;
+const MAST_Z = MAST_S * 0.5 * SLOOP.L;
+const MAST_D = topY(SLOOP, MAST_S);
+const MAST_TOP = [0, MAST_D + MAST_H, MAST_Z];
+const BOOM_A = [0, MAST_D + BOOM_H, MAST_Z];
+const BOOM_B = [Math.sin(BOOM_ANG) * BOOM_LEN, MAST_D + BOOM_H - 0.12, MAST_Z - Math.cos(BOOM_ANG) * BOOM_LEN];
+const STEM = [0, topY(SLOOP, 1) + 0.04, 0.5 * SLOOP.L];
+const FORESTAY_TOP = [0, MAST_D + MAST_H - 0.35, MAST_Z];
+// sail corners (tack, head, clew), leeward = +x
+const MAIN = [[0, BOOM_A[1] + 0.08, MAST_Z - 0.06], [0, MAST_TOP[1] - 0.45, MAST_Z - 0.06], lerp3(BOOM_A, BOOM_B, 0.96)];
+MAIN[2][1] += 0.08;
+const JIB = [[0, topY(SLOOP, 0.96) + 0.14, 0.96 * 0.5 * SLOOP.L], lerp3(STEM, FORESTAY_TOP, 0.84), [1.05, topY(SLOOP, 0.0) + 0.5, MAST_Z - 1.15]];
+
+// ---- galleon rig ------------------------------------------------------------------------
+const GAL = SHIP_TYPES[1];
+// masts: station, height above the deck, sails as [bottom, top] fractions of the height
+// with [bottom width, top width] in metres
+const GAL_MASTS = [
+  { s: 0.46, h: 24, sails: [[0.13, 0.40, 13.0, 12.0], [0.43, 0.68, 11.2, 9.0], [0.71, 0.86, 7.6, 5.6]] },
+  { s: 0.02, h: 28, sails: [[0.12, 0.40, 15.0, 14.0], [0.43, 0.68, 13.0, 10.5], [0.71, 0.86, 9.0, 6.5]] },
+  { s: -0.52, h: 17, sails: [[0.16, 0.45, 9.5, 8.6], [0.48, 0.74, 7.6, 5.8]] },
+].map((m) => {
+  const z = m.s * 0.5 * GAL.L, d = walkY(GAL, m.s);
+  return { ...m, z, d, top: d + m.h };
+});
+const SPRIT_A = [0, topY(GAL, 0.95) - 0.3, 0.47 * GAL.L];
+const SPRIT_B = [0, topY(GAL, 0.95) + 3.6, 0.5 * GAL.L + 8.5];
+const GAL_JIB = [lerp3(SPRIT_A, SPRIT_B, 0.55), lerp3([0, GAL_MASTS[0].d, GAL_MASTS[0].z], [0, GAL_MASTS[0].top, GAL_MASTS[0].z], 0.62),
+  [1.6, topY(GAL, 0.75) + 1.0, 0.36 * GAL.L]];
+const FLAG_LEN = 3.4, FLAG_H = 2.2;
+const FLAG_TOP = GAL_MASTS[1].top + 1.2;
+
+// ---- mesh -------------------------------------------------------------------------------
+// Interleaved vertices: position xyz + material, normal xyz + pivot z (32 bytes).
+// Materials: 0 hull, 1 deck, 2 cabin, 3 spar, 4 fore-and-aft sail (mirrored to leeward),
+// 5 rail, 6 boom (mirrored), 7 square sail and 8 yard (both braced about the mast at the
+// pivot z), 9 flag, 10 lantern, 11 rigging.
+function buildShip(type) {
+  const H = SHIP_TYPES[type];
+  const pos = [], nrm = [], mat = [], piv = [], idx = [];
+  function tri(a, b, c) {
+    idx.push(a, b, c);
+    const ux = pos[b * 3] - pos[a * 3], uy = pos[b * 3 + 1] - pos[a * 3 + 1], uz = pos[b * 3 + 2] - pos[a * 3 + 2];
+    const vx = pos[c * 3] - pos[a * 3], vy = pos[c * 3 + 1] - pos[a * 3 + 1], vz = pos[c * 3 + 2] - pos[a * 3 + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    for (const k of [a, b, c]) { nrm[k * 3] += nx; nrm[k * 3 + 1] += ny; nrm[k * 3 + 2] += nz; }
+  }
+  // parametric patch with smooth normals, oriented along out(p) (a rough outward vector)
+  function surf(rows, cols, at, m, out, pivot = 0) {
+    const base = pos.length / 3;
+    for (let i = 0; i <= rows; i++) {
+      for (let j = 0; j <= cols; j++) {
+        const p = at(i / rows, j / cols);
+        pos.push(p[0], p[1], p[2]); nrm.push(0, 0, 0); mat.push(m); piv.push(pivot);
+      }
+    }
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        const a = base + i * (cols + 1) + j, b = a + 1, c = a + cols + 1, d = c + 1;
+        tri(a, c, d); tri(a, d, b);
+      }
+    }
+    for (let k = base; k < pos.length / 3; k++) {
+      const o = out([pos[k * 3], pos[k * 3 + 1], pos[k * 3 + 2]]);
+      let nx = nrm[k * 3], ny = nrm[k * 3 + 1], nz = nrm[k * 3 + 2];
+      const l = Math.hypot(nx, ny, nz);
+      if (l < 1e-12) { nx = o[0]; ny = o[1]; nz = o[2]; } else { nx /= l; ny /= l; nz /= l; }
+      const sg = nx * o[0] + ny * o[1] + nz * o[2] < 0 ? -1 : 1;
+      nrm[k * 3] = nx * sg; nrm[k * 3 + 1] = ny * sg; nrm[k * 3 + 2] = nz * sg;
+    }
+  }
+  function tube(a, b, r0, r1, sides, m, pivot = 0) {
+    const ax = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const al = Math.hypot(...ax);
+    const d = ax.map((v) => v / al);
+    const h = Math.abs(d[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+    let e1 = [d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2], d[0] * h[1] - d[1] * h[0]];
+    const l1 = Math.hypot(...e1); e1 = e1.map((v) => v / l1);
+    const e2 = [d[1] * e1[2] - d[2] * e1[1], d[2] * e1[0] - d[0] * e1[2], d[0] * e1[1] - d[1] * e1[0]];
+    const ring = (u, v) => {
+      const r = r0 + (r1 - r0) * u, ang = v * 2 * Math.PI, c = Math.cos(ang) * r, s = Math.sin(ang) * r;
+      return [a[0] + ax[0] * u + e1[0] * c + e2[0] * s, a[1] + ax[1] * u + e1[1] * c + e2[1] * s, a[2] + ax[2] * u + e1[2] * c + e2[2] * s];
+    };
+    surf(1, sides, ring, m, (p) => {
+      const t = (p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1] + (p[2] - a[2]) * d[2];
+      return [p[0] - a[0] - d[0] * t, p[1] - a[1] - d[1] * t, p[2] - a[2] - d[2] * t];
+    }, pivot);
+  }
+  // cambered fore-and-aft sail between luff (tack -> head) and leech (clew -> head)
+  function sail(T, Hd, C, depth) {
+    surf(18, 10, (v, u) => {
+      const L = lerp3(T, Hd, v), R = lerp3(C, Hd, v);
+      const p = lerp3(L, R, u);
+      const cx = R[0] - L[0], cz = R[2] - L[2], chord = Math.hypot(cx, R[1] - L[1], cz);
+      // horizontal normal of the chord, pointing to leeward (+x)
+      const hl = (Math.hypot(cx, cz) || 1) * (cz > 0 ? -1 : 1);
+      const b = depth * chord * 4 * u * (1 - u) * (1 - 0.35 * u);
+      return [p[0] - (cz / hl) * b, p[1], p[2] + (cx / hl) * b];
+    }, 4, () => [1, 0, 0]);
+  }
+
+  // hull topsides and bottom, both sides
+  for (const sx of [1, -1]) {
+    surf(64, 16, (u, v) => {
+      const s = station(u), t = Math.pow(v, 2.2), yk = keelY(H, s), yt = topY(H, s);
+      return [sx * hullHalfW(H, s, yk + (yt - yk) * t), yk + (yt - yk) * t, s * 0.5 * H.L];
+    }, 0, (p) => [p[0], p[1] - 0.4 * H.draft, 0]);
+  }
+  // transom
+  surf(16, 1, (u, v) => {
+    const t = Math.pow(u, 2.2), yk = keelY(H, -1), yt = topY(H, -1), y = yk + (yt - yk) * t;
+    return [(2 * v - 1) * hullHalfW(H, -1, y), y, -0.5 * H.L];
+  }, 0, () => [0, 0, -1]);
+  // deck (slight camber) inside the bulwarks
+  const inset = H.bulwark > 0 ? 0.18 : 0;
+  surf(64, 8, (u, v) => {
+    const s = station(u), x = 2 * v - 1, y = walkY(H, s);
+    const w = Math.max(hullHalfW(H, s, y) - inset, 0);
+    return [x * w, y + 0.015 * H.B * (1 - x * x), s * 0.5 * H.L];
+  }, 1, () => [0, 1, 0]);
+  if (H.bulwark > 0) {
+    // inner face of the bulwarks and the rail cap
+    for (const sx of [1, -1]) {
+      surf(64, 1, (u, v) => {
+        const s = station(u), y = v < 0.5 ? walkY(H, s) : topY(H, s);
+        return [sx * Math.max(hullHalfW(H, s, y) - inset, 0), y, s * 0.5 * H.L];
+      }, 5, () => [-sx, 0, 0]);
+      surf(64, 1, (u, v) => {
+        const s = station(u), y = topY(H, s);
+        return [sx * Math.max(hullHalfW(H, s, y) - inset * (1 - v), 0), y + 0.08, s * 0.5 * H.L];
+      }, 5, () => [0, 1, 0]);
+    }
+  } else {
+    for (const sx of [1, -1]) {
+      surf(64, 1, (u, v) => {
+        const s = station(u);
+        return [sx * halfBeam(H, s), topY(H, s) + 0.07 * v, s * 0.5 * H.L];
+      }, 5, () => [sx, 0, 0]);
+    }
+  }
+
+  if (type === 0) {
+    // cabin trunk: sides lean inwards, cambered roof, flat front and companionway faces
+    const cabS = (u) => CAB_S0 + (CAB_S1 - CAB_S0) * u;
+    const camber = (s, x) => topY(H, s) + 0.05 * (1 - (x / halfBeam(H, s)) ** 2);
+    for (const sx of [1, -1]) {
+      surf(12, 1, (u, v) => {
+        const s = cabS(u), w = cabinHalfW(s);
+        return v < 0.5 ? [sx * w, camber(s, w) - 0.02, s * 0.5 * H.L] : [sx * w * 0.88, cabinTop(s), s * 0.5 * H.L];
+      }, 2, () => [sx, 0.2, 0]);
+    }
+    surf(12, 8, (u, v) => {
+      const s = cabS(u), x = (2 * v - 1) * cabinHalfW(s) * 0.88;
+      return [x, cabinTop(s) + 0.04 * (1 - (2 * v - 1) ** 2), s * 0.5 * H.L];
+    }, 2, () => [0, 1, 0]);
+    for (const [s, dz] of [[CAB_S1, 1], [CAB_S0, -1]]) {
+      surf(1, 8, (v, u) => {
+        const x = 2 * u - 1, w = cabinHalfW(s);
+        return v < 0.5 ? [x * w, camber(s, x * w) - 0.02, s * 0.5 * H.L]
+          : [x * w * 0.88, cabinTop(s) + 0.04 * (1 - x * x), s * 0.5 * H.L];
+      }, 2, () => [0, 0, dz]);
+    }
+    // rig
+    tube([0, MAST_D, MAST_Z], MAST_TOP, 0.085, 0.05, 12, 3);
+    tube(BOOM_A, BOOM_B, 0.065, 0.05, 10, 6);
+    tube(STEM, FORESTAY_TOP, 0.016, 0.016, 6, 3);
+    tube(MAST_TOP, [0, topY(H, -1) + 0.05, -0.5 * H.L + 0.15], 0.014, 0.014, 6, 3);
+    for (const sx of [1, -1]) {
+      const plate = [sx * halfBeam(H, MAST_S - 0.05) * 0.94, topY(H, MAST_S - 0.05) + 0.03, MAST_Z - 0.25];
+      tube([0, MAST_D + MAST_H * 0.8, MAST_Z], plate, 0.013, 0.013, 6, 3);
+      tube([0, MAST_D + MAST_H - 0.3, MAST_Z], plate, 0.013, 0.013, 6, 3);
+    }
+    sail(MAIN[0], MAIN[1], MAIN[2], 0.10);
+    sail(JIB[0], JIB[1], JIB[2], 0.12);
+  } else {
+    // masts, yards and square sails bellied forward by a following wind
+    for (const m of GAL_MASTS) {
+      tube([0, m.d - 0.5, m.z], [0, m.top + (m === GAL_MASTS[1] ? 1.4 : 0.4), m.z], 0.34 * m.h / 28, 0.12, 12, 3);
+      for (const [b, t, wb, wt] of m.sails) {
+        const yb = m.d + b * m.h, yt = m.d + t * m.h, hgt = yt - yb;
+        surf(10, 14, (v, u) => {
+          const w = wb + (wt - wb) * v;
+          const belly = 0.14 * hgt * 4 * u * (1 - u) * (0.55 + 0.45 * Math.sin(Math.PI * v));
+          // the foot curves up between the clews
+          const y = yb + hgt * v + (1 - v) * 0.25 * hgt * 4 * u * (1 - u) * 0.35;
+          return [(2 * u - 1) * w * 0.5, y, m.z + 0.5 + belly];
+        }, 7, () => [0, 0, 1], m.z);
+        tube([-wt * 0.55, yt + 0.15, m.z + 0.45], [wt * 0.55, yt + 0.15, m.z + 0.45], 0.16, 0.16, 8, 8, m.z);
+        // shrouds from each sail's head to the rail
+        for (const sx of [1, -1]) {
+          const rail = [sx * hullHalfW(GAL, m.s - 0.04, topY(GAL, m.s - 0.04)), topY(GAL, m.s - 0.04) + 0.1, m.z - 1.4];
+          tube([0, yt, m.z], rail, 0.045, 0.045, 5, 11);
+        }
+      }
+    }
+    tube(SPRIT_A, SPRIT_B, 0.32, 0.14, 10, 3);
+    // stays: mast tops to each other and to the bowsprit
+    tube([0, GAL_MASTS[0].top - 0.5, GAL_MASTS[0].z], SPRIT_B, 0.05, 0.05, 5, 11);
+    tube([0, GAL_MASTS[1].top - 0.5, GAL_MASTS[1].z], [0, GAL_MASTS[0].top - 2, GAL_MASTS[0].z], 0.05, 0.05, 5, 11);
+    tube([0, GAL_MASTS[2].top - 0.5, GAL_MASTS[2].z], [0, GAL_MASTS[1].d + 0.6 * GAL_MASTS[1].h, GAL_MASTS[1].z], 0.05, 0.05, 5, 11);
+    sail(GAL_JIB[0], GAL_JIB[1], GAL_JIB[2], 0.10);
+    // Jolly Roger: hoisted at the main masthead, flies downwind (animated in the shader)
+    surf(10, 4, (u, v) => [0, FLAG_TOP - FLAG_H * (1 - v), GAL_MASTS[1].z - 0.1 - FLAG_LEN * u], 9, () => [1, 0, 0], GAL_MASTS[1].z);
+    // stern lanterns
+    const sy = topY(GAL, -1);
+    for (const [lx, ly] of [[-2.1, 0.7], [2.1, 0.7], [0, 1.5]]) {
+      tube([lx, sy + ly, -0.5 * GAL.L + 0.3], [lx, sy + ly + 0.7, -0.5 * GAL.L + 0.3], 0.26, 0.2, 6, 10);
+    }
+  }
+
+  const nv = pos.length / 3;
+  const verts = new Float32Array(nv * 8);
+  for (let k = 0; k < nv; k++) {
+    verts.set([pos[k * 3], pos[k * 3 + 1], pos[k * 3 + 2], mat[k], nrm[k * 3], nrm[k * 3 + 1], nrm[k * 3 + 2], piv[k]], k * 8);
+  }
+  return { verts, idx: new Uint32Array(idx) };
+}
+
+const f3 = (x) => x.toFixed(4);
+const v3 = (p) => 'vec3f(' + p.map(f3).join(', ') + ')';
+const shapeCtor = (h) => 'Shape(' + SHAPE_KEYS.map((k) => f3(h[k])).join(', ') + ')';
+const galSailQuad = (m) => {
+  const lo = m.sails[0], hi = m.sails[m.sails.length - 1];
+  return `vec4f(${f3(m.z)}, ${f3(m.d + lo[0] * m.h)}, ${f3(m.d + hi[1] * m.h)}, ${f3(lo[2] * 0.5)}), vec4f(${f3(hi[3] * 0.5)}, ${f3(m.d)}, ${f3(m.top)}, 0.0)`;
+};
+
+// ---- WGSL: hull shapes + ship state -----------------------------------------------------
+const SHIP_SHAPE_WGSL = /* wgsl */ `
+const MAX_SHIPS: u32 = ${MAX_SHIPS}u;
+const CAB_S0: f32 = ${f3(CAB_S0)};
+const CAB_S1: f32 = ${f3(CAB_S1)};
+const FLAG_LEN: f32 = ${f3(FLAG_LEN)};
+const FLAG_H: f32 = ${f3(FLAG_H)};
+const FLAG_TOP: f32 = ${f3(FLAG_TOP)};
+const FLAG_Z: f32 = ${f3(GAL_MASTS[1].z)};
+
+struct Shape {
+  L: f32, B: f32, deck0: f32, sheerF: f32, sheerA: f32, castleA: f32, castleF: f32, draft: f32,
+  keelF: f32, keelA: f32, transom: f32, entry: f32, pAft: f32, pFwd: f32, tumble: f32, bulwark: f32, cabin: f32,
+};
+fn shapeOf(t: f32) -> Shape {
+  if (t > 0.5) { return ${shapeCtor(SHIP_TYPES[1])}; }
+  return ${shapeCtor(SHIP_TYPES[0])};
+}
+
+// Written by SHIP_SIM each frame (local -> world: pos + right*x + up*y + fwd*z).
+struct Ship {
+  right: vec4f,   // xyz starboard axis, w = fore-and-aft sail side (-1 port .. +1 starboard)
+  up:    vec4f,   // xyz, w = speed through the water (m/s)
+  fwd:   vec4f,   // xyz bow axis, w = heave velocity (m/s)
+  pos:   vec4f,   // xyz origin (midships, design waterline), w = yard brace angle (rad)
+  lag:   vec4f,   // xy = undisplaced (lagrangian) position, zw = horizontal bow direction
+  st0:   vec4f,   // physics: offset from the lagrangian position, w = initialised
+  st1:   vec4f,   // velocity
+  st2:   vec4f,   // pitch, pitch rate, roll, roll rate
+  kind:  vec4f,   // hull type (0 sloop, 1 galleon), sail colour (0 canvas, 1 black), active, flag angle (rad)
+};
+
+fn topY(h: Shape, s: f32) -> f32 {
+  let f = max(s, 0.0);
+  let a = min(s, 0.0);
+  return h.deck0 + h.sheerF * f * f + h.sheerA * a * a + h.castleA * (1.0 - smoothstep(-0.78, -0.5, s)) + h.castleF * smoothstep(0.62, 0.82, s);
+}
+fn walkY(h: Shape, s: f32) -> f32 { return topY(h, s) - h.bulwark; }
+fn keelY(h: Shape, s: f32) -> f32 {
+  return -h.draft * pow(max(1.0 - s * s, 1e-6), 0.55) + h.keelF * smoothstep(0.55, 1.0, s) + h.keelA * (1.0 - smoothstep(-1.0, -0.6, s));
+}
+fn halfBeam(h: Shape, s: f32) -> f32 {
+  if (s > 0.0) { return 0.5 * h.B * pow(max(1.0 - pow(s, h.entry), 1e-6), 0.55); }
+  return 0.5 * h.B * (1.0 - h.transom * s * s);
+}
+fn hullHalfW(h: Shape, s: f32, y: f32) -> f32 {
+  let yk = keelY(h, s);
+  let t = clamp((y - yk) / (topY(h, s) - yk), 1e-6, 1.0);
+  return halfBeam(h, s) * pow(t, mix(h.pAft, h.pFwd, smoothstep(-0.2, 1.0, s))) * (1.0 - h.tumble * smoothstep(0.55, 1.0, t));
+}
+fn cabinTop(h: Shape, s: f32) -> f32 { return topY(h, s) + 0.58 - 0.30 * smoothstep(0.12, CAB_S1, s); }
+fn cabinHalfW(h: Shape, s: f32) -> f32 { return 0.62 * halfBeam(h, s); }
+
+// solid hull (+ cabin), shrunk by 'inset' metres
+fn inHull(h: Shape, lp: vec3f, inset: f32) -> bool {
+  let s = lp.z / (0.5 * h.L);
+  if (abs(s) > 1.0 || lp.y < keelY(h, s) + inset) { return false; }
+  if (lp.y <= topY(h, s) - inset) { return abs(lp.x) <= hullHalfW(h, s, lp.y) - inset; }
+  return h.cabin > 0.5 && s > CAB_S0 && s < CAB_S1 && lp.y <= cabinTop(h, s) - inset && abs(lp.x) <= cabinHalfW(h, s) - inset;
+}
+`;
+
+// Ray tests against the ships, for their reflections and shadows on the water.
+// Requires SHIP_SHAPE_WGSL and a 'ships: array<Ship, MAX_SHIPS>' binding.
+const SHIP_RAY_WGSL = /* wgsl */ `
+const MAIN_T: vec3f = ${v3(MAIN[0])};
+const MAIN_H: vec3f = ${v3(MAIN[1])};
+const MAIN_C: vec3f = ${v3(MAIN[2])};
+const JIB_T: vec3f = ${v3(JIB[0])};
+const JIB_H: vec3f = ${v3(JIB[1])};
+const JIB_C: vec3f = ${v3(JIB[2])};
+const SL_MAST_A: vec3f = ${v3([0, MAST_D, MAST_Z])};
+const SL_MAST_B: vec3f = ${v3(MAST_TOP)};
+// galleon: per mast (z, sails bottom y, sails top y, half width at the bottom), (half width at the top, mast foot y, mast top y, -)
+const GAL_RIG: array<vec4f, 6> = array<vec4f, 6>(${GAL_MASTS.map(galSailQuad).join(', ')});
+
+fn toShip(sh: Ship, p: vec3f) -> vec3f {
+  let d = p - sh.pos.xyz;
+  return vec3f(dot(d, sh.right.xyz), dot(d, sh.up.xyz), dot(d, sh.fwd.xyz));
+}
+fn toShipDir(sh: Ship, v: vec3f) -> vec3f { return vec3f(dot(v, sh.right.xyz), dot(v, sh.up.xyz), dot(v, sh.fwd.xyz)); }
+
+fn rayTri(o: vec3f, d: vec3f, a: vec3f, b: vec3f, c: vec3f) -> f32 {
+  let e1 = b - a;
+  let e2 = c - a;
+  let p = cross(d, e2);
+  let det = dot(e1, p);
+  if (abs(det) < 1e-9) { return -1.0; }
+  let inv = 1.0 / det;
+  let s = o - a;
+  let u = dot(s, p) * inv;
+  let q = cross(s, e1);
+  let v = dot(d, q) * inv;
+  if (u < 0.0 || v < 0.0 || u + v > 1.0) { return -1.0; }
+  return dot(e2, q) * inv;
+}
+
+// closest approach of a ray to a segment: (distance, ray t)
+fn raySeg(o: vec3f, d: vec3f, a: vec3f, b: vec3f) -> vec2f {
+  let e = b - a;
+  let w = o - a;
+  let ee = dot(e, e);
+  let de = dot(d, e);
+  let den = max(ee - de * de, 1e-9);
+  let sc = clamp((dot(d, w) * de - dot(e, w)) / -den, 0.0, 1.0);
+  let tc = max(dot(a + e * sc - o, d), 0.0);
+  let sc2 = clamp(dot(o + d * tc - a, e) / ee, 0.0, 1.0);
+  return vec2f(distance(o + d * tc, a + e * sc2), tc);
+}
+
+// ray against an axis-aligned box: (t near, t far)
+fn rayBox(o: vec3f, d: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
+  let dd = select(d, vec3f(1e-6), abs(d) < vec3f(1e-6));
+  let t0 = (bmin - o) / dd;
+  let t1 = (bmax - o) / dd;
+  let tn = max(max(0.0, min(t0.x, t1.x)), max(min(t0.y, t1.y), min(t0.z, t1.z)));
+  let tf = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+  return vec2f(tn, tf);
+}
+
+fn rotY(p: vec3f, pivotZ: f32, a: f32) -> vec3f {
+  let z = p.z - pivotZ;
+  return vec3f(p.x * cos(a) + z * sin(a), p.y, -p.x * sin(a) + z * cos(a) + pivotZ);
+}
+
+// x = coverage (0..1), y = what was hit: 0 hull, 1 sail, 2 spar
+fn shipRay(i: u32, ro: vec3f, rd: vec3f) -> vec2f {
+  let sh = ships[i];
+  if (sh.kind.z < 0.5) { return vec2f(0.0); }
+  let h = shapeOf(sh.kind.x);
+  let o = toShip(sh, ro);
+  let d = toShipDir(sh, rd);
+  let gal = sh.kind.x > 0.5;
+  // whole ship including the rig
+  let top = select(15.0, 32.0, gal);
+  let bow = select(0.5 * h.L, 0.5 * h.L + 9.0, gal);
+  let bb = rayBox(o, d, vec3f(-0.5 * h.B - 8.0, -h.draft - 0.2, -0.5 * h.L - 1.0), vec3f(0.5 * h.B + 8.0, top, bow));
+  if (bb.y <= bb.x) { return vec2f(0.0); }
+  var best = 1e9;
+  var kind = 2.0;
+  var cov = 0.0;
+  if (gal) {
+    var rig = GAL_RIG;
+    for (var m = 0; m < 3; m++) {
+      let a = rig[m * 2];
+      let b = rig[m * 2 + 1];
+      let p0 = rotY(vec3f(-a.w, a.y, a.x + 0.5), a.x, sh.pos.w);
+      let p1 = rotY(vec3f(a.w, a.y, a.x + 0.5), a.x, sh.pos.w);
+      let p2 = rotY(vec3f(b.x, a.z, a.x + 0.5), a.x, sh.pos.w);
+      let p3 = rotY(vec3f(-b.x, a.z, a.x + 0.5), a.x, sh.pos.w);
+      var t = rayTri(o, d, p0, p1, p2);
+      if (t <= 0.0) { t = rayTri(o, d, p0, p2, p3); }
+      if (t > 0.0 && t < best) { best = t; kind = 1.0; cov = 1.0; }
+      if (cov == 0.0) {
+        let ms = raySeg(o, d, vec3f(0.0, b.y, a.x), vec3f(0.0, b.z, a.x));
+        cov = max(cov, (1.0 - smoothstep(0.25, 0.5, ms.x)) * step(1e-4, ms.y));
+      }
+    }
+  } else {
+    let sx = vec3f(sh.right.w, 1.0, 1.0);
+    let tm = rayTri(o, d, MAIN_T * sx, MAIN_H * sx, MAIN_C * sx);
+    if (tm > 0.0) { best = tm; kind = 1.0; cov = 1.0; }
+    let tj = rayTri(o, d, JIB_T * sx, JIB_H * sx, JIB_C * sx);
+    if (tj > 0.0 && tj < best) { best = tj; kind = 1.0; cov = 1.0; }
+    if (cov == 0.0) {
+      let ms = raySeg(o, d, SL_MAST_A, SL_MAST_B);
+      cov = (1.0 - smoothstep(0.06, 0.16, ms.x)) * step(1e-4, ms.y);
+    }
+  }
+  // hull: march through its bounding box
+  let hb = rayBox(o, d, vec3f(-0.5 * h.B, -h.draft - 0.1, -0.5 * h.L), vec3f(0.5 * h.B, h.deck0 + max(h.sheerF + h.castleF, h.sheerA + h.castleA) + 0.7, 0.5 * h.L));
+  if (hb.y > hb.x && hb.x < best) {
+    for (var k = 0; k < 24; k++) {
+      let t = mix(hb.x, hb.y, (f32(k) + 0.5) / 24.0);
+      if (t > best) { break; }
+      if (inHull(h, o + d * t, 0.0)) { return vec2f(1.0, 0.0); }
+    }
+  }
+  return vec2f(cov, kind);
+}
+
+// first ship hit by a ray: (coverage, kind, ship type, sail colour)
+fn shipsRay(ro: vec3f, rd: vec3f) -> vec4f {
+  var r = vec4f(0.0);
+  for (var i = 0u; i < MAX_SHIPS; i++) {
+    let h = shipRay(i, ro, rd);
+    if (h.x > r.x) { r = vec4f(h, ships[i].kind.x, ships[i].kind.y); }
+  }
+  return r;
+}
+
+// inside any hull (the water there is not drawn)
+fn inAnyHull(p: vec3f, inset: f32) -> bool {
+  for (var i = 0u; i < MAX_SHIPS; i++) {
+    let sh = ships[i];
+    if (sh.kind.z > 0.5 && inHull(shapeOf(sh.kind.x), toShip(sh, p), inset)) { return true; }
+  }
+  return false;
+}
+`;
+
+// Buoyancy: one workgroup per ship samples the water under 15 points of its hull, fits a
+// plane through them and lets heave, surge/sway, pitch and roll follow it as damped springs
+// (the hull length filters out the short waves; bigger hulls respond more slowly).
+const SHIP_SIM = FRAME_WGSL + SHIP_SHAPE_WGSL + /* wgsl */ `
+struct ShipIn {
+  base: vec4f,   // lagrangian x, z, heading (rad), speed (m/s)
+  p:    vec4f,   // dt, heel (rad), sail side, reset
+  q:    vec4f,   // hull type, sail colour, active, brace (rad)
+  r:    vec4f,   // flag angle (rad), -, -, -
+};
+struct ShipU {
+  ships: array<ShipIn, MAX_SHIPS>,
+  cascL: array<vec4f, 2>,
+  cascInvL: array<vec4f, 2>,
+};
+@group(0) @binding(0) var<uniform> U: ShipU;
+@group(0) @binding(1) var dispTex: texture_2d_array<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var<storage, read_write> ships: array<Ship, MAX_SHIPS>;
+@group(0) @binding(4) var<uniform> F: Frame;
+` + ROGUE_WGSL + /* wgsl */ `
+var<workgroup> pts: array<vec3f, 15>;
+
+@compute @workgroup_size(16)
+fn main(@builtin(local_invocation_index) i: u32, @builtin(workgroup_id) wg: vec3u) {
+  let si = U.ships[wg.x];
+  let h = shapeOf(si.q.x);
+  let hd = si.base.z;
+  let fw = vec2f(sin(hd), -cos(hd));
+  let rt = vec2f(cos(hd), sin(hd));
+  if (i < 15u) {
+    let s = -0.75 + f32(i / 3u) * 0.375;
+    let off = rt * ((f32(i % 3u) - 1.0) * 0.6 * halfBeam(h, s)) + fw * (s * 0.5 * h.L);
+    let x0 = si.base.xy + off;
+    var d = rogueAt(x0).d;
+    for (var c = 0u; c < ${CASCADES}u; c++) {
+      let texel = U.cascL[c >> 2u][c & 3u] / ${N}.0;
+      let lod = log2(max(0.07 * h.L / texel, 1.0));
+      d += textureSampleLevel(dispTex, samp, x0 * U.cascInvL[c >> 2u][c & 3u], c, lod).xyz;
+    }
+    pts[i] = vec3f(off.x + d.x, d.y, off.y + d.z);
+  }
+  workgroupBarrier();
+  if (i != 0u) { return; }
+
+  var m = vec3f(0.0);
+  for (var k = 0u; k < 15u; k++) { m += pts[k]; }
+  m /= 15.0;
+  var szy = 0.0; var szz = 0.0; var sxy = 0.0; var sxx = 0.0;
+  for (var k = 0u; k < 15u; k++) {
+    let q = pts[k] - m;
+    let lz = dot(q.xz, fw);
+    let lx = dot(q.xz, rt);
+    szy += lz * q.y; szz += lz * lz;
+    sxy += lx * q.y; sxx += lx * lx;
+  }
+  let pitchT = atan(szy / max(szz, 1e-4));
+  let rollT = -atan(sxy / max(sxx, 1e-4)) + si.p.y;
+
+  var sh = ships[wg.x];
+  var off = sh.st0.xyz;
+  var vel = sh.st1.xyz;
+  var ang = sh.st2;
+  if (si.p.w > 0.5 || sh.st0.w < 0.5) {
+    off = m; vel = vec3f(0.0); ang = vec4f(pitchT, 0.0, rollT, 0.0);
+  }
+  // natural frequencies (rad/s) scale with 1/sqrt(length); keel and sails damp roll strongly
+  let sc = sqrt(10.0 / h.L);
+  let wl = vec3f(1.6, 3.0, 1.6) * sc;
+  let zl = vec3f(0.9, 0.6, 0.9);
+  let wp = 2.2 * sc;
+  let wr = 1.7 * sc;
+  let dt = si.p.x * 0.25;
+  for (var k = 0; k < 4; k++) {
+    vel += (wl * wl * (m - off) - 2.0 * zl * wl * vel) * dt;
+    off += vel * dt;
+    ang.y += (wp * wp * (pitchT - ang.x) - 1.2 * wp * ang.y) * dt;
+    ang.x += ang.y * dt;
+    ang.w += (wr * wr * (rollT - ang.z) - 1.2 * wr * ang.w) * dt;
+    ang.z += ang.w * dt;
+  }
+  // heading, then pitch (bow up), then roll (starboard down)
+  let f0 = vec3f(fw.x, 0.0, fw.y);
+  let r0 = vec3f(rt.x, 0.0, rt.y);
+  let f1 = f0 * cos(ang.x) + vec3f(0.0, sin(ang.x), 0.0);
+  let u1 = vec3f(0.0, cos(ang.x), 0.0) - f0 * sin(ang.x);
+  sh.right = vec4f(r0 * cos(ang.z) - u1 * sin(ang.z), si.p.z);
+  sh.up = vec4f(u1 * cos(ang.z) + r0 * sin(ang.z), si.base.w);
+  sh.fwd = vec4f(f1, vel.y);
+  sh.pos = vec4f(si.base.x + off.x, off.y, si.base.y + off.z, si.q.w);
+  sh.lag = vec4f(si.base.xy, fw);
+  sh.st0 = vec4f(off, 1.0);
+  sh.st1 = vec4f(vel, 0.0);
+  sh.st2 = ang;
+  sh.kind = vec4f(si.q.xyz, si.r.x);
+  ships[wg.x] = sh;
+}
+`;
+
 // ---- js/wgsl/sim.js ----
 // FFT ocean simulation (Tessendorf) — 4 cascades of 256^2.
+
 
 const SIM_STRUCT = /* wgsl */ `
 const N: u32 = ${N}u;
@@ -543,7 +1167,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // World-space foam clipmaps (toroidally addressed, centred on the camera).
 // Foam is injected where the TOTAL surface Jacobian (all cascades) folds, then decays.
 const FOAM_RES = 1024;
-const FOAM_UPDATE = /* wgsl */ `
+const FOAM_UPDATE = FRAME_WGSL + SHIP_SHAPE_WGSL + /* wgsl */ `
 const RES: i32 = ${FOAM_RES};
 struct FoamU {
   snap: array<vec4i, 2>,     // per level: current camera texel (x, z), previous (x, z)
@@ -560,6 +1184,30 @@ struct FoamU {
 @group(0) @binding(4) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(5) var samp: sampler;
 @group(0) @binding(6) var sampPrev: sampler;
+@group(0) @binding(7) var<storage, read> ships: array<Ship, MAX_SHIPS>;
+@group(0) @binding(8) var<uniform> F: Frame;
+` + ROGUE_WGSL + /* wgsl */ `
+// bow wave and wash along the waterline, churned water astern
+fn wakeFoam(sh: Ship, p: vec2f) -> f32 {
+  let h = shapeOf(sh.kind.x);
+  let bd = p - sh.lag.xy;
+  let lz = dot(bd, sh.lag.zw);
+  let lx = dot(bd, vec2f(-sh.lag.w, sh.lag.z));
+  let sp = clamp(sh.up.w / 4.0, 0.0, 1.5);
+  let sl = lz / (0.5 * h.L);
+  var bi = 0.0;
+  if (abs(sl) < 1.0) {
+    let edge = abs(lx) - hullHalfW(h, sl, 0.0);
+    let bow = 0.25 + 0.75 * smoothstep(0.1, 0.8, sl);
+    bi = (sp * bow + 0.5 * min(abs(sh.fwd.w), 1.0)) * exp(-max(edge, 0.0) / (0.035 * h.L)) * step(-0.15, edge);
+  }
+  let astern = -lz - 0.5 * h.L;
+  if (astern > -0.3) {
+    let w = 0.27 * h.B + 0.12 * max(astern, 0.0);
+    bi = max(bi, sp * 0.8 * exp(-max(astern, 0.0) / (0.5 * h.L)) * (1.0 - smoothstep(0.35 * w, w, abs(lx))));
+  }
+  return bi * sh.kind.z;
+}
 
 fn wrapIdx(i: i32, lo: i32) -> i32 { return lo + (((i - lo) % RES) + RES) % RES; }
 
@@ -584,6 +1232,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       jxx += d.z; jzz += d.w; jxz += a.w;
     }
   }
+  let rg = rogueAt(p);
+  jxx += rg.jxx; jzz += rg.jzz; jxz += rg.jxz;
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
   var prev = vec4f(0.0);
   if (inPrev) {
@@ -592,12 +1242,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     prev = textureSampleLevel(prevTex, sampPrev, back, lvl, 0.0);
   }
   let dt = U.p0.z;
-  let inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  var inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  var bi = 0.0;
+  for (var k = 0u; k < MAX_SHIPS; k++) { bi = max(bi, wakeFoam(ships[k], p)); }
+  // churned water is patchy, not a solid band
+  let ch = fract(sin(dot(floor(p * 1.7), vec2f(12.9898, 78.233))) * 43758.5453);
+  bi *= 0.55 + 0.9 * ch;
+  let boatFoam = clamp(bi, 0.0, 1.0);
   var f = prev.r * exp(-dt * U.p0.w);
-  f = max(f, inject);
+  f = max(f, max(inject, boatFoam * 0.8));
   f = min(f + inject * dt * U.p1.z, 1.6);
   // g: freshness (recently injected) used for brighter, denser crest foam
-  let fresh = max(prev.g * exp(-dt * 1.6), inject);
+  let fresh = max(prev.g * exp(-dt * 1.6), max(inject, boatFoam * 0.45));
   textureStore(dst, id.xy, lvl, vec4f(f, fresh, J, 1.0));
 }
 `;
@@ -810,7 +1466,16 @@ fn sampleTrans(r: f32, mu: f32) -> vec3f {
 }
 
 fn sunIlluminance() -> vec3f {
-  return sampleTrans(camR(), F.sunDir.y) * F.sunDir.w;
+  // a storm overcast hides most of the sun
+  return sampleTrans(camR(), F.sunDir.y) * F.sunDir.w * (1.0 - 0.88 * F.storm.z);
+}
+
+// storm overcast: greyer, bluer, darker sky and clouds
+fn stormTint(L: vec3f) -> vec3f {
+  let lum = dot(L, vec3f(0.2126, 0.7152, 0.0722));
+  // flatten the bright glow around the hidden sun
+  let flat = lum / (1.0 + 0.35 * lum);
+  return mix(L, vec3f(flat) * vec3f(0.74, 0.82, 0.94) * 0.5, F.storm.z);
 }
 
 fn skyViewUV(dir: vec3f) -> vec2f {
@@ -841,7 +1506,9 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 }
 
 fn skyAtmo(dir: vec3f) -> vec3f {
-  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+  // under a storm deck the sky darkens towards the zenith
+  let deck = 1.0 - F.storm.z * 0.6 * smoothstep(0.0, 0.5, dir.y);
+  return stormTint(textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w) * deck;
 }
 `;
 
@@ -991,7 +1658,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
   *sunT = (1.0 - lo.a) * (1.0 - hi.a);
   // low layer in front; aerial perspective fades each layer into the haze without making
   // it transparent to the layer behind
-  let col = lo.rgb * loVis + hi.rgb * hiVis * (1.0 - lo.a);
+  let col = stormTint(lo.rgb * loVis + hi.rgb * hiVis * (1.0 - lo.a));
   let hidden = lo.a * loVis + hi.a * hiVis * (1.0 - lo.a);
   return vec4f(col, hidden);
 }
@@ -1006,7 +1673,7 @@ fn sunDisk(dir: vec3f) -> vec3f {
   let mu = sqrt(max(1.0 - x * x, 0.0));
   let limb = vec3f(1.0) - vec3f(0.397, 0.503, 0.652) * (1.0 - mu);
   let rad = F.sunDir.w / (PI * SUN_ANG_R * SUN_ANG_R);
-  return rad * limb * edge * sampleTrans(camR(), max(dir.y, -0.01));
+  return rad * limb * edge * sampleTrans(camR(), max(dir.y, -0.01)) * (1.0 - 0.97 * F.storm.z);
 }
 
 fn skyRadiance(dirIn: vec3f, withSun: bool, pixAng: f32) -> vec3f {
@@ -1122,6 +1789,7 @@ fn main(@builtin(local_invocation_index) k: u32) {
 // Ocean surface + sky background rendering.
 
 
+
 const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
@@ -1154,7 +1822,23 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   let aa = vec2f(fwidth(el), fwidth(eh));
   var sunT = 1.0;
   let cl = cloudLayers(d2, pixAng, aa, &sunT);
-  let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
+  var L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
+  // lightning: a jagged bolt from the cloud base to the sea
+  if (F.storm.x > 0.0) {
+    let az = atan2(dir.x, -dir.z);
+    let el = asin(clamp(dir.y, -1.0, 1.0));
+    let top = 0.16;
+    if (el > -0.002 && el < top) {
+      let sd = F.storm.y * 13.7;
+      let path = 0.018 * gnoise(vec2f(el * 22.0, sd)) + 0.007 * gnoise(vec2f(el * 85.0, sd + 4.0)) + 0.002 * gnoise(vec2f(el * 300.0, sd));
+      var da = az - F.storm.y - path;
+      da -= round(da / 6.2831853) * 6.2831853;
+      let w = pixAng * 0.9 + 0.0006;
+      let core = 1.0 - smoothstep(w, w * 2.5, abs(da));
+      let glow = exp(-abs(da) / 0.01) * 0.15;
+      L += vec3f(0.75, 0.82, 1.0) * (core * 900.0 + glow * 60.0) * F.storm.x * (1.0 - smoothstep(top - 0.03, top, el));
+    }
+  }
   return vec4f(L, 1.0);
 }
 `;
@@ -1168,7 +1852,8 @@ const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
-` + SKY_RENDER_FUNCS + /* wgsl */ `
+@group(0) @binding(12) var<storage, read> ships: array<Ship, MAX_SHIPS>;
+` + ROGUE_WGSL + SHIP_SHAPE_WGSL + SHIP_RAY_WGSL + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
 const TEX_N: f32 = ${N}.0;
@@ -1191,7 +1876,7 @@ struct VSOut {
   let mk = clamp((d - 0.8 * R) / (0.2 * R), 0.0, 1.0);
   xz -= fract(g * 0.5) * 2.0 * spacing * mk;
   let eff = spacing * (1.0 + mk);
-  var disp = vec3f(0.0);
+  var disp = rogueAt(xz).d;
   for (var c = 0u; c < ${CASCADES}u; c++) {
     let texel = F.cascL[c >> 2u][c & 3u] / TEX_N;
     let lod = log2(max(eff / texel, 1.0)) + 0.5;
@@ -1254,6 +1939,11 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     jxz += av.w;
     cov += vec3f(max(mv.x - dv.x * dv.x, 0.0), max(mv.y - dv.y * dv.y, 0.0), mv.z - dv.x * dv.y);
   }
+  let rg = rogueAt(xz);
+  s += rg.s;
+  jxx += rg.jxx;
+  jzz += rg.jzz;
+  jxz += rg.jxz;
   let dist = length(in.rel);
   let V = -in.rel / dist;
   let Ld = F.sunDir.xyz;
@@ -1274,7 +1964,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
+  // the ships' shadows (sails let some light through)
+  let Pw = in.rel + F.camPos.xyz;
+  let bsh = shipsRay(Pw, Ld);
+  let sunE = sunIlluminance() * sunVis[0] * (1.0 - bsh.x * select(1.0, 0.7, bsh.y == 1.0));
   let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
   // average radiance of the whole upper hemisphere (incl. the bright horizon band)
   let skyHemi = skyUp * 0.4 + 0.15 * (
@@ -1310,7 +2003,20 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   R.y = abs(R.y) * 0.4 + max(R.y, 0.0) * 0.6;
   R = normalize(R);
   let envLod = clamp(log2(max(2.0 * sig * ENV_TEXELS_PER_RAD, 1.0)), 0.0, ENV_MAXMIP);
-  let refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  var refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  // ships seen in the reflection (hulls in shade, sails glowing when backlit)
+  let brf = shipsRay(Pw, R);
+  if (brf.x > 0.0) {
+    let gal = brf.z > 0.5;
+    var bc = select(vec3f(0.78, 0.78, 0.76), vec3f(0.09, 0.06, 0.04), gal) * skyHemi * 1.3;
+    if (brf.y == 1.0) {
+      let cloth = select(vec3f(0.88, 0.85, 0.78), vec3f(0.62, 0.57, 0.47), gal);
+      bc = select(cloth, vec3f(0.035), brf.w > 0.5) * (skyHemi * 1.2 + sunE * 0.12 * pow(max(dot(R, Ld), 0.0), 2.0));
+    } else if (brf.y == 2.0) {
+      bc = vec3f(0.15) * skyHemi;
+    }
+    refl = mix(refl, bc, brf.x);
+  }
   let NdV = max(dot(nV, V), 0.0);
   // Fresnel from a partially smoothed normal: the long-wave facet plus the grazing-angle
   // statistics of everything finer (visible facets at grazing incidence stay highly reflective)
@@ -1388,6 +2094,8 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let hz = normalize(vec3f(-V.x, 0.002, -V.z));
   let fogCol = skyAtmo(hz);
   col = col * T + fogCol * (1.0 - T);
+  // no water inside the hulls
+  if (inAnyHull(Pw, 0.03)) { discard; }
   return vec4f(col, 1.0);
 }
 `;
@@ -1399,8 +2107,9 @@ const HEIGHT_PROBE = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(1) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<storage, read_write> outH: array<f32, 4>;
+` + ROGUE_WGSL + /* wgsl */ `
 fn dispAt(xz: vec2f) -> vec3f {
-  var d = vec3f(0.0);
+  var d = rogueAt(xz).d;
   for (var c = 0u; c < ${CASCADES}u; c++) {
     d += textureSampleLevel(dispTex, samp, xz * F.cascInvL[c >> 2u][c & 3u], c, 0.0).xyz;
   }
@@ -1415,6 +2124,249 @@ fn main() {
     x0 = goal - d.xz;
   }
   outH[0] = dispAt(x0).y;
+}
+`;
+
+
+// Ships. Sloop: gelcoat hull with boot stripe and antifouling, non-skid deck, teak, tinted
+// windows, aluminium spars. Galleon: planked dark wood, ochre gunport strake with black
+// ports, glowing stern windows and lanterns, tattered canvas or black sails, Jolly Roger.
+// Thin parts (sails, flag, rigging) are lit two-sided.
+const SHIP_RENDER = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
+@group(0) @binding(4) var envCube: texture_cube<f32>;
+@group(0) @binding(5) var<storage, read> ships: array<Ship, MAX_SHIPS>;
+@group(0) @binding(6) var<storage, read> sunVis: array<f32, 4>;
+` + SHIP_SHAPE_WGSL + SKY_RENDER_FUNCS + /* wgsl */ `
+const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
+
+struct VO {
+  @builtin(position) pos: vec4f,
+  @location(0) rel: vec3f,
+  @location(1) n: vec3f,
+  @location(2) lp: vec3f,
+  @location(3) @interpolate(flat) mat: u32,
+  @location(4) @interpolate(flat) ship: u32,
+};
+
+fn rotY(p: vec3f, pivotZ: f32, a: f32) -> vec3f {
+  let z = p.z - pivotZ;
+  return vec3f(p.x * cos(a) + z * sin(a), p.y, -p.x * sin(a) + z * cos(a) + pivotZ);
+}
+
+@vertex fn vs(@builtin(instance_index) si: u32, @location(0) p: vec4f, @location(1) nIn: vec4f) -> VO {
+  let sh = ships[si];
+  let m = u32(p.w + 0.5);
+  var lp = p.xyz;
+  var ln = nIn.xyz;
+  if (m == 4u || m == 6u) {
+    // fore-and-aft sails and boom swing to leeward (a gybe flattens them through the centreline)
+    let sd = sh.right.w;
+    lp.x *= sd;
+    ln = vec3f(ln.x, ln.y * sd, ln.z * sd);
+  } else if (m == 7u || m == 8u) {
+    // square sails and yards are braced round the mast
+    lp = rotY(lp, nIn.w, sh.pos.w);
+    ln = rotY(ln, 0.0, sh.pos.w);
+  } else if (m == 9u) {
+    // the flag ripples and streams downwind
+    let u = clamp((nIn.w - 0.1 - lp.z) / FLAG_LEN, 0.0, 1.0);
+    let ph = u * 7.0 - F.camPos.w * 11.0 + lp.y * 0.8;
+    lp.x += sin(ph) * 0.32 * u;
+    ln = normalize(vec3f(1.0, 0.0, 0.32 * (sin(ph) + 7.0 * u * cos(ph)) / FLAG_LEN));
+    lp = rotY(lp, nIn.w, sh.kind.w);
+    ln = rotY(ln, 0.0, sh.kind.w);
+  }
+  let w = sh.pos.xyz + sh.right.xyz * lp.x + sh.up.xyz * lp.y + sh.fwd.xyz * lp.z;
+  var o: VO;
+  o.rel = w - F.camPos.xyz;
+  o.pos = F.viewProj * vec4f(o.rel, 1.0);
+  o.n = sh.right.xyz * ln.x + sh.up.xyz * ln.y + sh.fwd.xyz * ln.z;
+  o.lp = p.xyz;
+  o.mat = m;
+  o.ship = si;
+  return o;
+}
+
+fn ggx(n: vec3f, v: vec3f, l: vec3f, rough: f32, f0: vec3f) -> vec3f {
+  let h = normalize(v + l);
+  let ndl = max(dot(n, l), 0.0);
+  let ndv = max(dot(n, v), 1e-3);
+  let ndh = max(dot(n, h), 0.0);
+  let a2 = max(rough * rough * rough * rough, 1e-5);
+  let dn = ndh * ndh * (a2 - 1.0) + 1.0;
+  let D = a2 / (PI * dn * dn);
+  let vis = 0.5 / max(ndl * sqrt(ndv * ndv * (1.0 - a2) + a2) + ndv * sqrt(ndl * ndl * (1.0 - a2) + a2), 1e-5);
+  let Fs = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
+  return D * vis * Fs * ndl;
+}
+
+fn segD(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+  let ab = b - a;
+  let t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+  return length(p - a - ab * t);
+}
+// skull and crossbones on the flag (p in metres from the hoist / foot); 1 = white
+fn jollyRoger(p: vec2f) -> f32 {
+  let c = vec2f(1.55, 1.32);
+  var w = 0.0;
+  // cranium and jaw
+  let q = p - c;
+  if (length(q * vec2f(1.0, 0.92)) < 0.42 || (abs(q.x) < 0.24 && q.y > -0.56 && q.y < -0.2)) { w = 1.0; }
+  // eye sockets, nose, teeth gaps
+  if (length(q - vec2f(-0.16, 0.0)) < 0.115 || length(q - vec2f(0.16, 0.0)) < 0.115) { w = 0.0; }
+  if (abs(q.x) < 0.045 && q.y > -0.22 && q.y < -0.1) { w = 0.0; }
+  if (q.y < -0.36 && q.y > -0.56 && abs(fract(q.x / 0.12 + 0.5) - 0.5) < 0.1 && abs(q.x) < 0.24) { w = 0.0; }
+  // crossed bones with knobbly ends
+  let b0 = c + vec2f(-0.85, -1.05);
+  let b1 = c + vec2f(0.85, -0.45);
+  let b2 = c + vec2f(-0.85, -0.45);
+  let b3 = c + vec2f(0.85, -1.05);
+  let bones = min(segD(p, b0, b1), segD(p, b2, b3));
+  var knob = 1e9;
+  for (var k = 0; k < 4; k++) {
+    let e = select(select(select(b3, b2, k == 2), b1, k == 1), b0, k == 0);
+    let dir = normalize(select(b1 - b0, b3 - b2, k >= 2)) * select(-1.0, 1.0, k == 1 || k == 3);
+    let side = vec2f(-dir.y, dir.x) * 0.07;
+    knob = min(knob, min(length(p - e - side), length(p - e + side)));
+  }
+  if (bones < 0.07 || knob < 0.09) { w = 1.0; }
+  return w;
+}
+
+@fragment fn fs(in: VO) -> @location(0) vec4f {
+  let sh = ships[in.ship];
+  let h = shapeOf(sh.kind.x);
+  let gal = sh.kind.x > 0.5;
+  let dist = length(in.rel);
+  let V = -in.rel / dist;
+  var n = normalize(in.n);
+  let thin = in.mat == 4u || in.mat >= 6u;
+  if (thin && dot(n, V) < 0.0) { n = -n; }
+  let lp = in.lp;
+  let s = lp.z / (0.5 * h.L);
+
+  var alb = vec3f(0.80, 0.80, 0.78);
+  var rough = 0.3;
+  var metal = 0.0;
+  var emit = vec3f(0.0);
+  var trans = 0.0;
+  switch (in.mat) {
+    case 0u: {
+      if (gal) {
+        // planked dark oak, a low ochre strake with gun ports, weed and copper below the waterline
+        let plank = smoothstep(0.0, 0.06, abs(fract(lp.y / 0.34) - 0.5) - 0.44);
+        alb = vec3f(0.11, 0.07, 0.04) * (0.7 + 0.3 * plank) * (0.85 + 0.3 * gnoise(lp.zy * vec2f(0.15, 2.0)));
+        rough = 0.75;
+        let gy = walkY(h, s) - 1.25;
+        if (abs(lp.y - gy) < 0.6) { alb = vec3f(0.40, 0.28, 0.09) * (0.8 + 0.2 * plank); }
+        if (abs(lp.y - gy + 0.95) < 0.12 || abs(lp.y - gy - 0.95) < 0.10) { alb = vec3f(0.035, 0.025, 0.018); }
+        if (abs(s) < 0.62 && abs(lp.y - gy) < 0.36 && abs(fract(lp.z / 2.4 + 0.5) - 0.5) < 0.16) { alb = vec3f(0.01); }
+        if (lp.y < 0.15) { alb = vec3f(0.06, 0.07, 0.05); rough = 0.9; }
+        // stern gallery windows
+        if (s < -0.985) {
+          let ty = topY(h, -1.0);
+          if (lp.y > ty - 2.3 && lp.y < ty - 1.3 && abs(lp.x) < 2.2 && abs(fract(lp.x / 0.88) - 0.5) < 0.36) {
+            emit = vec3f(2.6, 1.35, 0.45) * (0.85 + 0.15 * sin(F.camPos.w * 7.0 + lp.x));
+            alb = vec3f(0.02);
+          }
+        }
+      } else {
+        // white gelcoat; navy sheer line and boot stripe; antifouling below the waterline
+        alb = vec3f(0.82, 0.82, 0.80);
+        rough = 0.16;
+        let dy = topY(h, s) - lp.y;
+        if ((dy > 0.10 && dy < 0.15) || (lp.y > 0.05 && lp.y < 0.15)) { alb = vec3f(0.02, 0.05, 0.14); rough = 0.14; }
+        if (lp.y < 0.05) { alb = vec3f(0.05, 0.035, 0.03); rough = 0.6; }
+      }
+    }
+    case 1u: {
+      if (gal) {
+        let plank = smoothstep(0.0, 0.05, abs(fract(lp.x / 0.26) - 0.5) - 0.45);
+        alb = vec3f(0.30, 0.21, 0.12) * (0.75 + 0.25 * plank);
+        rough = 0.8;
+      } else {
+        alb = vec3f(0.60, 0.60, 0.57);
+        rough = 0.8;
+        if (s < -0.45 && abs(lp.x) < 0.62 * halfBeam(h, s)) { alb = vec3f(0.36, 0.22, 0.12); rough = 0.65; }
+      }
+    }
+    case 2u: {
+      alb = vec3f(0.80, 0.80, 0.78);
+      rough = 0.28;
+      let hy = lp.y - topY(h, s);
+      let side = abs(lp.x) > 0.75 * cabinHalfW(h, s);
+      if (side && hy > 0.24 && hy < 0.42 && s > -0.30 && s < 0.14) { alb = vec3f(0.015, 0.02, 0.025); rough = 0.04; }
+    }
+    case 4u, 7u: {
+      if (gal) {
+        // weathered, patched and torn canvas (or the black sails of the flagship)
+        let st = gnoise(lp.xy * 0.35 + vec2f(sh.kind.y * 7.0, 3.0));
+        alb = select(vec3f(0.62, 0.57, 0.47), vec3f(0.035, 0.033, 0.03), sh.kind.y > 0.5) * (0.82 + 0.3 * st);
+        let tear = gnoise(lp.xy * 1.6 + vec2f(f32(in.ship) * 11.0, 0.0)) + 0.5 * gnoise(lp.xy * 4.1);
+        if (tear > 0.52) { discard; }
+        trans = select(0.45, 0.12, sh.kind.y > 0.5);
+      } else {
+        alb = vec3f(0.88, 0.85, 0.78);
+        trans = 0.45;
+      }
+      rough = 0.75;
+    }
+    case 5u: {
+      alb = select(vec3f(0.40, 0.25, 0.13), vec3f(0.14, 0.09, 0.05), gal);
+      rough = 0.6;
+    }
+    case 9u: {
+      // black ensign; flag coordinates in metres from the hoist and the foot
+      alb = vec3f(0.02);
+      rough = 0.9;
+      trans = 0.1;
+      let fp = vec2f(FLAG_Z - 0.1 - lp.z, lp.y - (FLAG_TOP - FLAG_H));
+      alb = mix(alb, vec3f(0.80, 0.78, 0.72), jollyRoger(fp));
+    }
+    case 10u: {
+      alb = vec3f(0.05);
+      emit = vec3f(9.0, 4.8, 1.5) * (0.8 + 0.2 * sin(F.camPos.w * 13.0 + lp.x * 3.0));
+    }
+    case 11u: {
+      alb = vec3f(0.04, 0.035, 0.03);
+      rough = 0.9;
+    }
+    default: {
+      if (gal) {
+        alb = vec3f(0.17, 0.11, 0.065);
+        rough = 0.7;
+      } else {
+        alb = vec3f(0.62, 0.63, 0.65);
+        rough = 0.32;
+        metal = 0.85;
+      }
+    }
+  }
+
+  let Ld = F.sunDir.xyz;
+  let sunE = sunIlluminance() * sunVis[0];
+  let ndl = dot(n, Ld);
+  let ndv = max(dot(n, V), 1e-3);
+  // sky above, hazy sea below (the env cube holds both)
+  let amb = textureSampleLevel(envCube, sampC, n, ENV_MAXMIP - 1.0).rgb;
+  let f0 = mix(vec3f(0.04), alb, metal);
+  var col = alb * (1.0 - metal) * (amb * 1.4 + sunE * max(ndl, 0.0) * 0.318);
+  col += sunE * ggx(n, V, Ld, max(rough, 0.08), f0);
+  let R = reflect(-V, n);
+  let env = textureSampleLevel(envCube, sampC, R, rough * ENV_MAXMIP).rgb;
+  let fe = f0 + (1.0 - f0) * pow(1.0 - ndv, 5.0) * (1.0 - rough) * (1.0 - rough);
+  col += env * fe;
+  if (trans > 0.0) {
+    // cloth lets light through: glows when the sun is behind it
+    let back = textureSampleLevel(envCube, sampC, -n, ENV_MAXMIP - 1.0).rgb;
+    col += alb * (sunE * max(-ndl, 0.0) * 0.318 + back * 0.78) * trans;
+  }
+  col += emit;
+
+  let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
+  let hz = normalize(vec3f(-V.x, max(-V.y, 0.002), -V.z));
+  col = col * T + skyAtmo(hz) * (1.0 - T);
+  return vec4f(col, 1.0);
 }
 `;
 
@@ -1490,7 +2442,8 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+struct P { p: vec4f, q: vec4f, r: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+// r: time (s), rain amount, lightning flash, rain slant
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -1523,6 +2476,28 @@ fn agxLook(v: vec3f, sat: f32, power: f32) -> vec3f {
   let p = pow(max(v, vec3f(0.0)), vec3f(power));
   return l + sat * (p - l);
 }
+fn hash21(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
+
+// wind-slanted rain streaks in three depth layers (screen space)
+fn rain(uv: vec2f, aspect: f32) -> f32 {
+  var r = 0.0;
+  for (var l = 0; l < 3; l++) {
+    let fl = f32(l);
+    let scale = 34.0 + fl * 26.0;
+    var p = vec2f(uv.x * aspect, uv.y) * vec2f(scale, scale * 0.11);
+    p.x += p.y * U.r.w * 9.0;
+    p.y -= U.r.x * (2.4 + fl * 0.9);
+    let cell = floor(p);
+    let f = fract(p);
+    let h = hash21(cell + fl * 17.0);
+    let x = 0.15 + 0.7 * hash21(cell.yx * 1.7 + fl);
+    let len = 0.35 + 0.4 * h;
+    let streak = (1.0 - smoothstep(0.0, 0.05 + fl * 0.02, abs(f.x - x))) * smoothstep(0.0, 0.1, f.y) * (1.0 - smoothstep(len - 0.1, len, f.y));
+    r += streak * step(h, 0.55) * (0.5 - fl * 0.12);
+  }
+  return r;
+}
+
 fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
 
 @fragment fn fs(in: VO) -> @location(0) vec4f {
@@ -1532,6 +2507,14 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   // the up-chain accumulates 8 blur levels
   let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * (1.0 / 8.0);
   c = mix(c, b, U.p.y);
+  // lightning flash lights everything with cold light; rain veils and streaks the view
+  let lumIn = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  c += vec3f(0.55, 0.62, 0.8) * U.r.z * (0.35 + 1.5 * lumIn);
+  if (U.r.y > 0.0) {
+    let veil = vec3f(lumIn * 0.6 + 0.02) * vec3f(0.85, 0.9, 1.0);
+    c = mix(c, veil, 0.18 * U.r.y);
+    c += vec3f(0.06, 0.065, 0.075) * (0.6 + lumIn * 2.0 + U.r.z * 4.0) * rain(in.uv, dims.x / dims.y) * U.r.y;
+  }
   c *= U.p.x;
   // subtle vignette
   let d = (in.uv - 0.5) * vec2f(dims.x / dims.y, 1.0);
@@ -1555,6 +2538,7 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
 // FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
+
 
 
 
@@ -1587,6 +2571,26 @@ const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
+  boatSpeed: 3.0,      // m/s through the water (the sloop; the galleons keep station)
+  overcast: 0.0,       // storm: grey sky, hidden sun
+  rain: 0.0,
+  lightning: 0.0,      // strikes per ~8 s
+  rogueHeight: 32,     // m crest to trough
+};
+// Scene presets: the original sunset; "after the storm" (default): a huge leftover sea under
+// a low golden sun breaking through the clouds, with rogue waves; and a full storm.
+const SCENES = {
+  sunset: { ...P },
+  swell: {
+    ...P, windSpeed: 14, fetchKm: 400, swellHs: 4.2, swellDir: 104, swellLength: 170, swellSpread: 30, choppy: 1.05,
+    turbidity: 1.2, foam: 1.3, sunElev: 3.2, sunAzim: 4, exposure: 1.45, haze: 4.5, clouds: 0.62, veil: 0.5, bloom: 0.12,
+    overcast: 0.12, rain: 0, lightning: 0,
+  },
+  storm: {
+    ...P, windSpeed: 16, fetchKm: 400, swellHs: 4.0, swellDir: 104, swellLength: 170, swellSpread: 30, choppy: 1.05,
+    turbidity: 0.9, foam: 1.5, sunElev: 4.0, exposure: 1.9, haze: 7.0, clouds: 0.95, veil: 0.95, bloom: 0.14,
+    overcast: 0.8, rain: 0.8, lightning: 1.0,
+  },
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -1675,7 +2679,7 @@ async function main() {
   const fullArr = (t) => t.createView({ dimension: '2d-array' });
 
   const [initPipe, evolvePipe, rowsPipe, colsPipe, simMipPipe, foamGenPipe, rgba8MipPipe,
-    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe] = await Promise.all([
+    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe, shipSimPipe] = await Promise.all([
     computePipe(SIM_INIT, 'sim init'),
     computePipe(SIM_EVOLVE, 'sim evolve'),
     computePipe(FFT_ROWS, 'fft rows'),
@@ -1691,6 +2695,7 @@ async function main() {
     computePipe(FOAM_UPDATE, 'foam update'),
     computePipe(ARRAY16_MIPS, 'array16 mips'),
     computePipe(SUN_VIS, 'sun visibility'),
+    computePipe(SHIP_SIM, 'ship sim'),
   ]);
 
   const bg = (pipe, entries, label) => device.createBindGroup({
@@ -1747,8 +2752,14 @@ async function main() {
   const samplerSim = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat',
   });
+  // Ships: poses (buoyancy) are simulated on the GPU and stay there
+  const frameUBO = mkBuf(448, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const shipBuf = mkBuf(144 * MAX_SHIPS, GU.STORAGE, 'ship state');
+  const shipUBO = mkBuf(320, GU.UNIFORM | GU.COPY_DST, 'ship ubo');
+  const shipF = new Float32Array(80);
+  const bgShipSim = bg(shipSimPipe, [{ buffer: shipUBO }, fullArr(dispTex), samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'ship sim');
   const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
-    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim], 'foamupd' + i));
+    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'foamupd' + i));
   const bgFoamMips = [0, 1].map((i) => {
     const out = [];
     for (let m = 1; m < FOAMW_MIPS; m++) out.push(bg(arr16MipPipe, [lvl(foamW[i], m - 1), lvl(foamW[i], m)]));
@@ -1778,7 +2789,6 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
@@ -1797,9 +2807,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, shipMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(SHIP_RENDER, 'ships'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -1808,6 +2818,18 @@ async function main() {
       buffers: [{ arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }],
     },
     fragment: { module: oceanMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const shipPipe = await device.createRenderPipelineAsync({
+    label: 'ships', layout: 'auto',
+    vertex: {
+      module: shipMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 32, attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' }, { shaderLocation: 1, offset: 16, format: 'float32x4' }] }],
+    },
+    fragment: { module: shipMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
@@ -1841,7 +2863,17 @@ async function main() {
 
   const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+    fullArr(foamW[i]), { buffer: sunVisBuf }, { buffer: shipBuf }], 'ocean' + i));
+  const bgShip = bg(shipPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, envCubeView,
+    { buffer: shipBuf }, { buffer: sunVisBuf }], 'ships');
+  const shipMeshes = SHIP_TYPES.map((_, t) => {
+    const m = buildShip(t);
+    const vb = mkBuf(m.verts.byteLength, GU.VERTEX | GU.COPY_DST, 'ship vertices ' + t);
+    const ib = mkBuf(m.idx.byteLength, GU.INDEX | GU.COPY_DST, 'ship indices ' + t);
+    device.queue.writeBuffer(vb, 0, m.verts);
+    device.queue.writeBuffer(ib, 0, m.idx);
+    return { vb, ib, count: m.idx.length };
+  });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
@@ -1886,8 +2918,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const BLOOM_LEVELS = 8;
   const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-  const compUBO = mkBuf(32, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
-  const compData = new Float32Array(8);
+  const compUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
+  const compData = new Float32Array(12);
   const bloomUBOs = [];
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
@@ -1970,7 +3002,7 @@ async function main() {
   // Uniform data
   // --------------------------------------------------------------------------------------
   const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const frameF = new Float32Array(112);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -2037,13 +3069,196 @@ async function main() {
   }
 
   // --------------------------------------------------------------------------------------
+  // Fleet: the sloop sails a wide circle across the start view with two pirate galleons in
+  // pursuit (the flagship under black sails). Fore-and-aft sails go to leeward, square sails
+  // are braced to the wind, flags stream downwind. ?ships=0 removes them.
+  // --------------------------------------------------------------------------------------
+  const FLEET = [
+    { type: 0, sail: 0, r: 220, dth: 0, heel: 7 },
+    { type: 1, sail: 1, r: 250, dth: -0.13, heel: 3 },
+    { type: 1, sail: 0, r: 285, dth: -0.30, heel: 3 },
+  ].slice(0, qs.get('ships') === '0' ? 0 : MAX_SHIPS);
+  const fleet = { cx: 0, cz: -330, theta: Math.PI / 2 - 0.10, reset: 1 };
+  if (qs.get('boatAt')) fleet.theta = Number(qs.get('boatAt')) * D2R;
+  for (const sh of FLEET) { sh.side = 0; sh.brace = 0; }
+  function updateFleet(dt) {
+    const omega = P.boatSpeed / 220;
+    fleet.theta += omega * dt;
+    const wx = Math.cos(P.windDir * D2R), wz = Math.sin(P.windDir * D2R);
+    shipF.fill(0);
+    FLEET.forEach((sh, i) => {
+      const th = fleet.theta + sh.dth;
+      const head = th + Math.PI;
+      const fx = Math.sin(head), fz = -Math.cos(head), rx = Math.cos(head), rz = Math.sin(head);
+      // wind direction relative to the bow (positive = blowing towards starboard)
+      const rel = Math.atan2(wx * rx + wz * rz, wx * fx + wz * fz);
+      const lee = rel >= 0 ? 1 : -1;
+      if (!sh.side) sh.side = lee;
+      sh.side += (lee - sh.side) * Math.min(1, dt * 0.6);
+      const braceT = Math.max(-0.55, Math.min(0.55, Math.abs(rel) > Math.PI / 2 ? rel - Math.PI * lee : rel));
+      sh.brace += (braceT - sh.brace) * Math.min(1, dt * 0.5);
+      const o = i * 16;
+      shipF[o] = fleet.cx + sh.r * Math.cos(th); shipF[o + 1] = fleet.cz + sh.r * Math.sin(th);
+      sh.x = shipF[o]; sh.z = shipF[o + 1]; sh.head = head;
+      shipF[o + 2] = head; shipF[o + 3] = omega * sh.r;
+      shipF[o + 4] = dt;
+      shipF[o + 5] = sh.heel * D2R * sh.side * Math.min(1, P.boatSpeed / 3) * Math.min(1.5, P.windSpeed / 7);
+      shipF[o + 6] = sh.side; shipF[o + 7] = fleet.reset;
+      shipF[o + 8] = sh.type; shipF[o + 9] = sh.sail; shipF[o + 10] = 1; shipF[o + 11] = sh.brace;
+      shipF[o + 12] = rel + Math.PI;
+    });
+    for (let c = 0; c < C; c++) { shipF[64 + c] = CASC_L[c]; shipF[72 + c] = 1 / CASC_L[c]; }
+    fleet.reset = 0;
+    device.queue.writeBuffer(shipUBO, 0, shipF);
+  }
+
+  // --------------------------------------------------------------------------------------
+  // Filming: ?rec=seconds&name=take.webm records the canvas (after ?warm seconds) and posts
+  // it to the dev server. The camera can glide from cam= to cam2=, or ride along with ship
+  // follow=i at off=right,up,forward,yawDeg,pitchDeg (gliding to off2=).
+  // --------------------------------------------------------------------------------------
+  // ?film=frames&fdt=1/30&name=take renders an exact frame sequence instead (fixed time step,
+  // each frame read back and posted as name_00000.jpg); the camera moves over the frames.
+  const filmN = Number(qs.get('film')) || 0;
+  const film = { idx: 0, t: 0 };
+  const recSecs = Number(qs.get('rec')) || 0;
+  const recWarm = qs.has('warm') ? Number(qs.get('warm')) : 3;
+  const rec = { state: recSecs ? 'warm' : 'off', t: 0, recorder: null, chunks: [] };
+  const vec = (k) => (qs.get(k) ? qs.get(k).split(',').map(Number) : null);
+  const cam1 = vec('cam'), cam2 = vec('cam2'), off1 = vec('off'), off2 = vec('off2');
+  const followIdx = qs.has('follow') ? Number(qs.get('follow')) : -1;
+  function updateRec(dt) {
+    if (rec.state === 'off' || rec.state === 'done') return;
+    rec.t += dt;
+    if (rec.state === 'warm' && rec.t >= recWarm) {
+      const rcd = new MediaRecorder(canvas.captureStream(60), { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 60e6 });
+      rcd.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
+      rcd.onstop = async () => {
+        const name = qs.get('name') || 'take.webm';
+        await fetch('/__shot?name=' + encodeURIComponent(name), { method: 'POST', body: new Blob(rec.chunks, { type: 'video/webm' }) });
+        log('rec saved ' + name);
+        document.title = 'REC DONE';
+      };
+      rcd.start(1000);
+      rec.recorder = rcd; rec.state = 'rec'; rec.t = 0;
+    } else if (rec.state === 'rec' && rec.t >= recSecs) {
+      rec.recorder.stop();
+      rec.state = 'done';
+    }
+  }
+  function directCamera() {
+    if (!cam2 && followIdx < 0) return;
+    const x = filmN ? Math.min(1, film.idx / filmN) : rec.state === 'rec' ? Math.min(1, rec.t / recSecs) : rec.state === 'done' ? 1 : 0;
+    const k = x * x * (3 - 2 * x);
+    const mix = (a, b) => (b ? a.map((v, i) => v + (b[i] - v) * k) : a);
+    if (followIdx >= 0 && FLEET[followIdx] && off1) {
+      const sh = FLEET[followIdx], o = mix(off1, off2);
+      const rx = Math.cos(sh.head), rz = Math.sin(sh.head), fx = Math.sin(sh.head), fz = -Math.cos(sh.head);
+      cam.x = sh.x + rx * o[0] + fx * o[2]; cam.z = sh.z + rz * o[0] + fz * o[2];
+      cam.y = Math.max(o[1], waterH + 0.9);
+      cam.yaw = sh.head + (o[3] || 0) * D2R; cam.pitch = (o[4] || 0) * D2R;
+    } else if (cam1 && cam2) {
+      const c = mix(cam1, cam2);
+      cam.x = c[0]; cam.z = c[2]; cam.y = Math.max(c[1], waterH + 0.9);
+      cam.yaw = c[3] * D2R; cam.pitch = c[4] * D2R;
+    }
+  }
+
+  // --------------------------------------------------------------------------------------
+  // Rogue wave: a 200 m long, steep wave group that runs downwind across the camera's
+  // position (G, the panel button, or every ~50 s in the storm).
+  // --------------------------------------------------------------------------------------
+  let sceneName = 'swell';
+  const ROGUE_L = 180, ROGUE_K = 2 * Math.PI / ROGUE_L, ROGUE_C = Math.sqrt(9.81 / ROGUE_K);
+  const rogue = { on: false, u: 0, amp: 0, ox: 0, oz: 0, dx: 0, dz: 1, wait: 8 };
+  function triggerRogue() {
+    rogue.on = true; rogue.u = -480;
+    rogue.dx = Math.cos(P.windDir * D2R); rogue.dz = Math.sin(P.windDir * D2R);
+    rogue.ox = cam.x; rogue.oz = cam.z;
+  }
+  function updateRogue(dt) {
+    if (!rogue.on) {
+      rogue.amp = 0;
+      if (sceneName !== 'sunset' && P.rogueHeight > 0) { rogue.wait -= dt; if (rogue.wait <= 0) triggerRogue(); }
+      return;
+    }
+    rogue.u += ROGUE_C * dt;
+    const fade = Math.min(1, (rogue.u + 480) / 120) * Math.min(1, Math.max(0, (450 - rogue.u) / 200));
+    rogue.amp = P.rogueHeight / 1.6 * fade;
+    if (rogue.u > 450) { rogue.on = false; rogue.wait = 50; }
+  }
+  // ?rogueU=-150: start a rogue wave that far from the camera (once the camera is placed)
+  let pendingRogueU = qs.has('rogueU') ? Number(qs.get('rogueU')) : null;
+
+  // --------------------------------------------------------------------------------------
+  // Lightning (and thunder, once audio is allowed)
+  // --------------------------------------------------------------------------------------
+  const strike = { t: 99, next: 3, az: 0 };
+  function updateLightning(dt) {
+    strike.t += dt;
+    if (P.lightning > 0) {
+      strike.next -= dt * P.lightning;
+      if (strike.next <= 0) {
+        strike.t = 0; strike.next = 4 + Math.random() * 9;
+        strike.az = cam.yaw + (Math.random() - 0.5) * 1.6;
+        thunder(0.6 + Math.random() * 2.5);
+      }
+    }
+    const t = strike.t;
+    return t < 1.2 ? Math.exp(-t * 6) * (0.55 + 0.45 * Math.cos(t * 60)) : 0;
+  }
+
+  // procedural storm audio: wind, rain and surf noise beds plus thunder
+  let audio = null;
+  function initAudio() {
+    if (audio) return;
+    try {
+      const ac = new AudioContext();
+      const len = ac.sampleRate * 2;
+      const buf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = buf.getChannelData(0);
+      let b = 0;
+      for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; b = (b + 0.02 * w) / 1.02; d[i] = w * 0.5 + b * 6; }
+      const bed = (type, freq, q) => {
+        const src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+        const f = ac.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+        const g = ac.createGain(); g.gain.value = 0;
+        src.connect(f).connect(g).connect(ac.destination); src.start();
+        return g;
+      };
+      audio = { ac, buf, wind: bed('bandpass', 420, 0.5), rain: bed('highpass', 2600, 0.4), surf: bed('lowpass', 260, 0.7) };
+    } catch (e) { audio = false; }
+  }
+  addEventListener('pointerdown', initAudio);
+  addEventListener('keydown', initAudio);
+  function thunder(delay) {
+    if (!audio) return;
+    const { ac, buf } = audio;
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 180 + Math.random() * 200;
+    const g = ac.createGain();
+    const t0 = ac.currentTime + delay;
+    g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.9, t0 + 0.08);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 4.5);
+    src.connect(f).connect(g).connect(ac.destination); src.start(t0); src.stop(t0 + 5);
+  }
+  function updateAudio(dt) {
+    if (!audio) return;
+    const k = Math.min(1, dt * 2);
+    const gust = 0.8 + 0.2 * Math.sin(performance.now() * 0.0007) * Math.sin(performance.now() * 0.0013);
+    audio.wind.gain.value += (Math.min(0.5, P.windSpeed * P.windSpeed / 700) * gust - audio.wind.gain.value) * k;
+    audio.rain.gain.value += (P.rain * 0.12 - audio.rain.gain.value) * k;
+    audio.surf.gain.value += ((0.1 + P.swellHs * 0.05 + rogue.amp * 0.02) - audio.surf.gain.value) * k;
+  }
+
+  // --------------------------------------------------------------------------------------
   // CDLOD node selection (CPU, allocation free)
   // --------------------------------------------------------------------------------------
   const ranges = new Float64Array(LODS);
   for (let l = 0; l < LODS; l++) ranges[l] = R0 * Math.pow(2, l);
   const planes = new Float64Array(16);
-  const HB = 4.0;   // vertical bound of displaced surface
-  const XB = 4.0;   // horizontal displacement margin for culling
+  let HB = 4.0;   // vertical bound of displaced surface
+  let XB = 4.0;   // horizontal displacement margin for culling
   let nodeCount = 0, ccx = 0, ccy = 0, ccz = 0;
 
   function sphereHit(x0, z0, size, r) {
@@ -2084,6 +3299,9 @@ async function main() {
   }
   function selectAll() {
     nodeCount = 0;
+    const sea = 0.9 * P.swellHs + 0.012 * P.windSpeed * P.windSpeed;
+    HB = 4 + sea + rogue.amp * 1.05;
+    XB = 4 + 0.6 * sea + rogue.amp * 1.8;
     ccx = cam.x; ccy = cam.y; ccz = cam.z;
     // side planes from the camera-relative view-projection (rows 3±0, 3±1)
     const m = viewProj;
@@ -2107,6 +3325,7 @@ async function main() {
   // Per-frame uniforms
   // --------------------------------------------------------------------------------------
   let simTime = Number(qs.get('t')) || 0;
+  let flash = 0;
   let frameIndex = 0;
 
   function writeFrame(time) {
@@ -2148,6 +3367,11 @@ async function main() {
     f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
     f[91] = 1.1e-4;
     f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    f[96] = rogue.dx; f[97] = rogue.dz; f[98] = rogue.u; f[99] = rogue.amp;
+    f[100] = rogue.ox; f[101] = rogue.oz; f[102] = ROGUE_K;
+    f[103] = Math.min(1.6, 0.68 / Math.max(ROGUE_K * rogue.amp, 1e-3));
+    f[104] = 120; f[105] = 520;
+    f[108] = flash; f[109] = strike.az; f[110] = P.overcast; f[111] = P.rain;
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -2157,10 +3381,10 @@ async function main() {
   const panel = document.getElementById('panel');
   function togglePanel() { panel.classList.toggle('hidden'); }
   const SLIDERS = [
-    ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
+    ['windSpeed', 'Wind speed (m/s)', 2, 25, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
     ['fetchKm', 'Fetch (km)', 5, 800, 1, 'spec'],
-    ['swellHs', 'Swell height (m)', 0, 4, 0.05, 'spec'],
+    ['swellHs', 'Swell height (m)', 0, 8, 0.05, 'spec'],
     ['swellLength', 'Swell wavelength (m)', 30, 300, 1, 'spec'],
     ['swellDir', 'Swell direction (deg)', 0, 360, 1, 'spec'],
     ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
@@ -2173,7 +3397,22 @@ async function main() {
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
+    ['boatSpeed', 'Boat speed (m/s)', 0, 8, 0.1, ''],
+    ['overcast', 'Storm overcast', 0, 1, 0.01, ''],
+    ['rain', 'Rain', 0, 1, 0.01, ''],
+    ['lightning', 'Lightning', 0, 3, 0.01, ''],
+    ['rogueHeight', 'Rogue wave (m)', 0, 35, 0.5, ''],
   ];
+  // scene and event buttons
+  const btnRow = document.createElement('div');
+  btnRow.className = 'btns';
+  const mkBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; btnRow.appendChild(b); };
+  mkBtn('After storm', () => applyScene('swell'));
+  mkBtn('Storm', () => applyScene('storm'));
+  mkBtn('Sunset', () => applyScene('sunset'));
+  mkBtn('Rogue wave (G)', () => triggerRogue());
+  panel.appendChild(btnRow);
+  const inputs = {};
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
     const name = document.createElement('span'); name.textContent = label;
@@ -2188,7 +3427,20 @@ async function main() {
     });
     row.append(name, inp, val);
     panel.appendChild(row);
+    inputs[key] = [inp, val];
   }
+  sceneName = 'swell';
+  function applyScene(name) {
+    sceneName = name;
+    Object.assign(P, SCENES[name]);
+    for (const k in inputs) { inputs[k][0].value = P[k]; inputs[k][1].textContent = String(P[k]); }
+    needSpectrum = true; needLUT = true; envFull = 2;
+  }
+  addEventListener('keydown', (e) => {
+    if (e.code === 'KeyG') triggerRogue();
+    if (e.code === 'KeyT') applyScene({ swell: 'storm', storm: 'sunset', sunset: 'swell' }[sceneName]);
+  });
+  applyScene(SCENES[qs.get('scene')] ? qs.get('scene') : 'swell');
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
@@ -2202,7 +3454,7 @@ async function main() {
   const shotFrames = Number(qs.get('frames')) || 240;
   const shotSeq = Number(qs.get('seq')) || 1;
   let shotIdx = 0;
-  const fixedDt = shotName ? 1 / 60 : 0;
+  const fixedDt = filmN ? Number(qs.get('fdt')) || 1 / 30 : shotName ? 1 / 60 : 0;
   let last = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
@@ -2222,6 +3474,12 @@ async function main() {
       const s = N >> m;
       cp.setBindGroup(0, bgSimMips[m - 1]);
       cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), C);
+    }
+    // ship poses (read by the foam update and the render passes below)
+    if (FLEET.length) {
+      cp.setPipeline(shipSimPipe);
+      cp.setBindGroup(0, bgShipSim);
+      cp.dispatchWorkgroups(MAX_SHIPS);
     }
     // foam clipmaps
     foamCur = 1 - foamCur;
@@ -2281,6 +3539,13 @@ async function main() {
     simF[52] = simTime; simF[53] = dt;
     device.queue.writeBuffer(simUBO, 0, simF);
     writeFoamUniforms(dt);
+    updateFleet(dt);
+    updateRec(dt);
+    directCamera();
+    if (pendingRogueU !== null) { triggerRogue(); rogue.u = pendingRogueU; pendingRogueU = null; }
+    updateRogue(dt);
+    flash = updateLightning(dt);
+    updateAudio(dt);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -2334,6 +3599,16 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    if (FLEET.length) {
+      rp.setPipeline(shipPipe);
+      rp.setBindGroup(0, bgShip);
+      FLEET.forEach((sh, i) => {
+        const m = shipMeshes[sh.type];
+        rp.setVertexBuffer(0, m.vb);
+        rp.setIndexBuffer(m.ib, 'uint32');
+        rp.drawIndexed(m.count, 1, 0, 0, i);
+      });
+    }
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -2356,6 +3631,8 @@ async function main() {
 
     compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
     compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 0;
+    compData[8] = simTime; compData[9] = P.rain; compData[10] = flash * (0.4 + 0.6 * P.overcast);
+    compData[11] = -Math.sin(P.windDir * D2R - cam.yaw) * 0.12 * Math.min(1, P.windSpeed / 15);
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
@@ -2366,7 +3643,7 @@ async function main() {
     pc.end();
 
     let doProbe = false;
-    if (!probePending && (frameIndex & 7) === 0) {
+    if (!probePending && ((frameIndex & 7) === 0 || filmN)) {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
       doProbe = true;
     }
@@ -2375,6 +3652,13 @@ async function main() {
       enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
       enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
       doTs = true;
+    }
+    let filmBuf = null;
+    film.t += dt;
+    if (filmN && film.idx < filmN && film.t >= recWarm) {
+      shooting = true;
+      filmBuf = device.createBuffer({ size: Math.ceil(W * 4 / 256) * 256 * H, usage: GU.MAP_READ | GU.COPY_DST });
+      enc.copyTextureToBuffer({ texture: swapTex }, { buffer: filmBuf, bytesPerRow: Math.ceil(W * 4 / 256) * 256 }, [W, H]);
     }
     let readBuf = null;
     if (shotName && shotIdx < shotSeq && frameIndex >= shotFrames + shotIdx) {
@@ -2389,6 +3673,31 @@ async function main() {
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
+    if (filmBuf) saveFilm(filmBuf, Math.ceil(W * 4 / 256) * 256);
+  }
+
+  async function saveFilm(buf, bpr) {
+    await buf.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buf.getMappedRange());
+    const img = new ImageData(W, H);
+    const d = img.data, bgra = swapFormat === 'bgra8unorm';
+    for (let y = 0; y < H; y++) {
+      for (let x = 0, s0 = y * bpr, d0 = y * W * 4; x < W; x++, s0 += 4, d0 += 4) {
+        d[d0] = src[s0 + (bgra ? 2 : 0)]; d[d0 + 1] = src[s0 + 1]; d[d0 + 2] = src[s0 + (bgra ? 0 : 2)]; d[d0 + 3] = 255;
+      }
+    }
+    buf.unmap();
+    buf.destroy();
+    const oc = new OffscreenCanvas(W, H);
+    oc.getContext('2d').putImageData(img, 0, 0);
+    const blob = await oc.convertToBlob({ type: 'image/jpeg', quality: 0.94 });
+    const name = (qs.get('name') || 'film') + '_' + String(film.idx).padStart(5, '0') + '.jpg';
+    await fetch('/__shot?name=' + encodeURIComponent(name), { method: 'POST', body: blob });
+    film.idx++;
+    shooting = false;
+    if (film.idx < filmN) { requestAnimationFrame(frame); return; }
+    log('film done ' + (qs.get('name') || 'film') + ' ' + filmN + ' frames');
+    document.title = 'FILM DONE';
   }
 
   async function saveShot(buf, bpr, go) {

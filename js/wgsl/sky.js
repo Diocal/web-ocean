@@ -192,7 +192,16 @@ fn sampleTrans(r: f32, mu: f32) -> vec3f {
 }
 
 fn sunIlluminance() -> vec3f {
-  return sampleTrans(camR(), F.sunDir.y) * F.sunDir.w;
+  // a storm overcast hides most of the sun
+  return sampleTrans(camR(), F.sunDir.y) * F.sunDir.w * (1.0 - 0.88 * F.storm.z);
+}
+
+// storm overcast: greyer, bluer, darker sky and clouds
+fn stormTint(L: vec3f) -> vec3f {
+  let lum = dot(L, vec3f(0.2126, 0.7152, 0.0722));
+  // flatten the bright glow around the hidden sun
+  let flat = lum / (1.0 + 0.35 * lum);
+  return mix(L, vec3f(flat) * vec3f(0.74, 0.82, 0.94) * 0.5, F.storm.z);
 }
 
 fn skyViewUV(dir: vec3f) -> vec2f {
@@ -223,7 +232,9 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 }
 
 fn skyAtmo(dir: vec3f) -> vec3f {
-  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+  // under a storm deck the sky darkens towards the zenith
+  let deck = 1.0 - F.storm.z * 0.6 * smoothstep(0.0, 0.5, dir.y);
+  return stormTint(textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w) * deck;
 }
 `;
 
@@ -373,7 +384,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
   *sunT = (1.0 - lo.a) * (1.0 - hi.a);
   // low layer in front; aerial perspective fades each layer into the haze without making
   // it transparent to the layer behind
-  let col = lo.rgb * loVis + hi.rgb * hiVis * (1.0 - lo.a);
+  let col = stormTint(lo.rgb * loVis + hi.rgb * hiVis * (1.0 - lo.a));
   let hidden = lo.a * loVis + hi.a * hiVis * (1.0 - lo.a);
   return vec4f(col, hidden);
 }
@@ -388,7 +399,7 @@ fn sunDisk(dir: vec3f) -> vec3f {
   let mu = sqrt(max(1.0 - x * x, 0.0));
   let limb = vec3f(1.0) - vec3f(0.397, 0.503, 0.652) * (1.0 - mu);
   let rad = F.sunDir.w / (PI * SUN_ANG_R * SUN_ANG_R);
-  return rad * limb * edge * sampleTrans(camR(), max(dir.y, -0.01));
+  return rad * limb * edge * sampleTrans(camR(), max(dir.y, -0.01)) * (1.0 - 0.97 * F.storm.z);
 }
 
 fn skyRadiance(dirIn: vec3f, withSun: bool, pixAng: f32) -> vec3f {

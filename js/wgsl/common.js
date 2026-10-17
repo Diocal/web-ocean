@@ -29,7 +29,51 @@ struct Frame {
   foamP:    vec4f,     // J threshold, J gain, foam intensity, lace sharpness
   fogExt:   vec4f,     // rgb extinction per metre near sea level
   cloudP:   vec4f,     // altitude km, coverage, optical density, wind time
+  rogueA:   vec4f,     // rogue wave: travel direction xy (unit), crest position along it (m), amplitude (m)
+  rogueB:   vec4f,     // origin xy, wavenumber, Gerstner steepness Q
+  rogueC:   vec4f,     // group length along travel (m), crest length (m), -, -
+  storm:    vec4f,     // lightning flash, bolt azimuth (rad), overcast, rain
 };
+`;
+
+// Rogue wave: a single steep Gerstner wave group (one giant crest between deep troughs)
+// added on top of the FFT sea. Returns displacement, slope and Jacobian terms in the same
+// (lagrangian) form as the FFT textures. Requires FRAME_WGSL and a 'F: Frame' binding.
+export const ROGUE_WGSL = /* wgsl */ `
+struct Rogue { d: vec3f, s: vec2f, jxx: f32, jzz: f32, jxz: f32 };
+fn rogueAt(x0: vec2f) -> Rogue {
+  var r: Rogue;
+  let A = F.rogueA.w;
+  if (A <= 0.0) { return r; }
+  let dir = F.rogueA.xy;
+  let perp = vec2f(-dir.y, dir.x);
+  let q = x0 - F.rogueB.xy;
+  let u = dot(q, dir) - F.rogueA.z;
+  let v = dot(q, perp);
+  let sw = F.rogueC.x;
+  let lw = F.rogueC.y;
+  let env = A * exp(-(u * u) / (sw * sw) - (v * v) / (lw * lw));
+  if (env < 1e-3) { return r; }
+  let envU = env * (-2.0 * u / (sw * sw));
+  let envV = env * (-2.0 * v / (lw * lw));
+  let k = F.rogueB.z;
+  let Q = F.rogueB.w;
+  let c = cos(k * u);
+  let sn = sin(k * u);
+  let hx = -Q * env * sn;
+  let hU = envU * c - env * k * sn;
+  let hV = envV * c;
+  let hxU = -Q * (envU * sn + env * k * c);
+  let hxV = -Q * envV * sn;
+  r.d = vec3f(dir.x * hx, env * c, dir.y * hx);
+  r.s = vec2f(hU * dir.x + hV * perp.x, hU * dir.y + hV * perp.y);
+  let gx = hxU * dir.x + hxV * perp.x;
+  let gz = hxU * dir.y + hxV * perp.y;
+  r.jxx = dir.x * gx;
+  r.jzz = dir.y * gz;
+  r.jxz = 0.5 * (dir.x * gz + dir.y * gx);
+  return r;
+}
 `;
 
 export const ATMO_CORE_WGSL = /* wgsl */ `

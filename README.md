@@ -1,5 +1,8 @@
 # web-ocean
 
+> **Fork note:** this fork adds pirate galleons, a sailboat, GPU buoyancy, ship wakes, rogue waves, storm weather and a frame-by-frame filming mode on top of [Noniv/web-ocean](https://github.com/Noniv/web-ocean). The ocean renderer itself is Noniv's work.
+> Live demo: **https://oceano-piratas.vercel.app**
+
 A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds. You fly around it with a free camera.
 
 ![Looking toward the sun from 2.4 m above the water](docs/front.jpg)
@@ -12,7 +15,7 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
+Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (91 KB instead of 153 KB). Both are self-contained and work from `file://`.
 
 To run from source:
 
@@ -63,6 +66,20 @@ The atmosphere follows Hillaire's approach, with transmittance, multiple-scatter
 
 Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-aliased analytically: the screen-space derivative of each layer's edge function sets the width of its opacity edge. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
 
+### Ships, rogue waves and weather
+
+The page opens "after the storm": a big leftover sea under a low golden sun breaking through the clouds. `T` (or the panel) cycles through that scene, a full storm with rain and lightning, and the original calm sunset.
+
+- **Ships.** A 10 m sloop sails a wide circle, chased by two 30 m pirate galleons. The flagship has black sails. Each galleon has a sterncastle and forecastle, an ochre gunport strake, glowing stern windows and lanterns, tattered square sails braced to the wind, and a Jolly Roger that streams downwind. Hulls are analytic shapes, so the mesh, the water clipped inside the hull, and the ray tests on the water all use one definition.
+- **Buoyancy.** It runs on the GPU with one workgroup per ship and no readback. Each ship samples the sea under 15 points of its hull and fits a plane through them. Heave, surge and sway, pitch, and roll follow that plane as damped springs. Larger hulls respond more slowly.
+- **Wakes, reflections and shadows.** The foam simulation adds a bow wave, wash and churned water astern for every ship. The water shader traces the reflected ray and the sun ray against hulls, sails, and masts.
+- **Rogue wave.** `G`, the panel button, or roughly every 50 s (except in the sunset scene) sends a single steep Gerstner wave group, 180 m long, downwind across the camera. Its default height is 32 m from crest to trough, with deep troughs before and after it. It is added analytically to the displacement, slopes, and Jacobian, so it gets correct shading, foam on its crest, buoyancy for the ships, and lift for the camera.
+- **Weather.** An overcast deck greys the sky and hides the sun. Lightning bolts are drawn in the sky and flash the whole scene. Rain streaks are drawn in screen space. After the first click or key press, procedural audio plays wind, rain, surf, and delayed thunder.
+
+URL parameters: `scene=swell|storm|sunset`, `ships=0`, `boatAt=deg` (fleet position), `rogueU=-150` (start a rogue wave that many metres away), plus any slider key such as `rain=0` or `rogueHeight=20`.
+
+**Camera and filming.** `follow=i&off=right,up,forward,yawDeg,pitchDeg` rides along with ship `i` (0 = sloop, 1 = black-sailed flagship, 2 = second galleon). With the dev server (`npm start`), `film=frames&fdt=0.0333&name=take` renders an exact frame sequence: a fixed time step, every frame saved to `shots/take_00000.jpg`. In that mode the camera glides from `cam=` to `cam2=`, or from `off=` to `off2=`. `rec=seconds` records the canvas in real time instead.
+
 ### Post-processing
 
 The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
@@ -77,7 +94,8 @@ The per-frame code reuses preallocated typed arrays and descriptors, so the garb
 
 - Far water is still somewhat darker than the bright horizon sky above it.
 - The water is tuned toward turbid coastal water. The "Water turbidity" slider gives darker, bluer deep water when turned down.
-- The scene is open ocean only. There is no shoreline, surf, or objects in the water.
+- The scene is open ocean only, with no shoreline or surf. Ships do not push waves into the water; they only add foam.
+- The rogue wave does not break or throw spray. Its crest folds into dense foam.
 - Clouds are two flat layers, not volumetric.
 
 ## How it was made
@@ -90,7 +108,7 @@ I built this with Claude Code (Opus 5.5). I asked for the most realistic water i
 |---|---|
 | `index.html` | Page shell, HUD, and settings panel styles |
 | `js/main.js` | Device setup, resources, camera, per-frame loop |
-| `js/wgsl/` | Shaders as JavaScript modules: `sim.js` (waves and foam), `sky.js` (atmosphere and clouds), `ocean.js` (surface and sky pass), `post.js` (bloom and tone mapping), `common.js` (shared structs) |
+| `js/wgsl/` | Shaders as JavaScript modules: `boat.js` (ship geometry, buoyancy, ray tests), `sim.js` (waves and foam), `sky.js` (atmosphere and clouds), `ocean.js` (surface, ship and sky passes), `post.js` (bloom and tone mapping), `common.js` (shared structs) |
 | `server.mjs` | Tiny static server for development |
 | `build.mjs` | Builds `ocean.html` and `ocean.min.html` |
 | `docs/` | README images |

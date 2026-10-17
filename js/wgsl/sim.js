@@ -1,5 +1,6 @@
 // FFT ocean simulation (Tessendorf) — 4 cascades of 256^2.
-import { N, LOGN, CASCADES, NOISE_WGSL, PERIODIC_WGSL } from './common.js';
+import { N, LOGN, CASCADES, NOISE_WGSL, PERIODIC_WGSL, FRAME_WGSL, ROGUE_WGSL } from './common.js';
+import { SHIP_SHAPE_WGSL } from './boat.js';
 
 const SIM_STRUCT = /* wgsl */ `
 const N: u32 = ${N}u;
@@ -345,7 +346,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // World-space foam clipmaps (toroidally addressed, centred on the camera).
 // Foam is injected where the TOTAL surface Jacobian (all cascades) folds, then decays.
 export const FOAM_RES = 1024;
-export const FOAM_UPDATE = /* wgsl */ `
+export const FOAM_UPDATE = FRAME_WGSL + SHIP_SHAPE_WGSL + /* wgsl */ `
 const RES: i32 = ${FOAM_RES};
 struct FoamU {
   snap: array<vec4i, 2>,     // per level: current camera texel (x, z), previous (x, z)
@@ -362,6 +363,30 @@ struct FoamU {
 @group(0) @binding(4) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(5) var samp: sampler;
 @group(0) @binding(6) var sampPrev: sampler;
+@group(0) @binding(7) var<storage, read> ships: array<Ship, MAX_SHIPS>;
+@group(0) @binding(8) var<uniform> F: Frame;
+` + ROGUE_WGSL + /* wgsl */ `
+// bow wave and wash along the waterline, churned water astern
+fn wakeFoam(sh: Ship, p: vec2f) -> f32 {
+  let h = shapeOf(sh.kind.x);
+  let bd = p - sh.lag.xy;
+  let lz = dot(bd, sh.lag.zw);
+  let lx = dot(bd, vec2f(-sh.lag.w, sh.lag.z));
+  let sp = clamp(sh.up.w / 4.0, 0.0, 1.5);
+  let sl = lz / (0.5 * h.L);
+  var bi = 0.0;
+  if (abs(sl) < 1.0) {
+    let edge = abs(lx) - hullHalfW(h, sl, 0.0);
+    let bow = 0.25 + 0.75 * smoothstep(0.1, 0.8, sl);
+    bi = (sp * bow + 0.5 * min(abs(sh.fwd.w), 1.0)) * exp(-max(edge, 0.0) / (0.035 * h.L)) * step(-0.15, edge);
+  }
+  let astern = -lz - 0.5 * h.L;
+  if (astern > -0.3) {
+    let w = 0.27 * h.B + 0.12 * max(astern, 0.0);
+    bi = max(bi, sp * 0.8 * exp(-max(astern, 0.0) / (0.5 * h.L)) * (1.0 - smoothstep(0.35 * w, w, abs(lx))));
+  }
+  return bi * sh.kind.z;
+}
 
 fn wrapIdx(i: i32, lo: i32) -> i32 { return lo + (((i - lo) % RES) + RES) % RES; }
 
@@ -386,6 +411,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       jxx += d.z; jzz += d.w; jxz += a.w;
     }
   }
+  let rg = rogueAt(p);
+  jxx += rg.jxx; jzz += rg.jzz; jxz += rg.jxz;
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
   var prev = vec4f(0.0);
   if (inPrev) {
@@ -394,12 +421,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     prev = textureSampleLevel(prevTex, sampPrev, back, lvl, 0.0);
   }
   let dt = U.p0.z;
-  let inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  var inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  var bi = 0.0;
+  for (var k = 0u; k < MAX_SHIPS; k++) { bi = max(bi, wakeFoam(ships[k], p)); }
+  // churned water is patchy, not a solid band
+  let ch = fract(sin(dot(floor(p * 1.7), vec2f(12.9898, 78.233))) * 43758.5453);
+  bi *= 0.55 + 0.9 * ch;
+  let boatFoam = clamp(bi, 0.0, 1.0);
   var f = prev.r * exp(-dt * U.p0.w);
-  f = max(f, inject);
+  f = max(f, max(inject, boatFoam * 0.8));
   f = min(f + inject * dt * U.p1.z, 1.6);
   // g: freshness (recently injected) used for brighter, denser crest foam
-  let fresh = max(prev.g * exp(-dt * 1.6), inject);
+  let fresh = max(prev.g * exp(-dt * 1.6), max(inject, boatFoam * 0.45));
   textureStore(dst, id.xy, lvl, vec4f(f, fresh, J, 1.0));
 }
 `;
