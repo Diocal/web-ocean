@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Overboard</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"}}</script>
+<script>
+  // standalone headsets get the WebXR version only (the WebGPU ocean is far too heavy for them)
+  window.__vrOnly = /OculusBrowser|Quest|Pico|Wolvic/i.test(navigator.userAgent) || new URLSearchParams(location.search).get('vr') === 'flat';
+</script>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -59,7 +64,7 @@
 <div id="intro" class="scrim">
   <h1>Overboard</h1>
   <p>A ten-metre sloop, the sun about to set and two galleons on the horizon. Step aboard.</p>
-  <div class="row"><button id="bStart" class="main">Start</button><button id="bFree">Free roam</button></div>
+  <div class="row"><button id="bStart" class="main">Start</button><button id="bVR" class="main" hidden>Enter VR</button><button id="bFree">Free roam</button></div>
   <div class="keys">Best with headphones · mouse and keyboard</div>
 </div>
 <div id="pause" class="scrim">

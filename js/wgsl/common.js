@@ -33,7 +33,32 @@ struct Frame {
   rogueB:   vec4f,     // origin xy, wavenumber, Gerstner steepness Q
   rogueC:   vec4f,     // group length along travel (m), crest length (m), -, -
   storm:    vec4f,     // lightning flash, bolt azimuth (rad), overcast, rain
+  night:    vec4f,     // night amount (stars, grade), lantern intensity, sea fog density (1/m), -
+  lamp:     vec4f,     // hand-held lantern offset from the eye: right, up, forward (m), flicker
 };
+`;
+
+// The hand-held lantern: a warm point light near the eye. Irradiance at a point, and the
+// light it scatters into the sea fog along a view ray (single scattering, closed form for
+// an inverse-square source: the integral of 1/(s^2 + h^2) along the ray). Needs 'F: Frame'.
+export const LAMP_WGSL = /* wgsl */ `
+const LAMP_COL: vec3f = vec3f(1.0, 0.56, 0.22);
+fn lampPos() -> vec3f {
+  return F.camPos.xyz + normalize(F.camRight.xyz) * F.lamp.x + normalize(F.camUp.xyz) * F.lamp.y + F.camFwd.xyz * F.lamp.z;
+}
+fn lampE(p: vec3f) -> vec3f {
+  let d = lampPos() - p;
+  return LAMP_COL * (F.night.y * F.lamp.w / max(dot(d, d), 0.05));
+}
+fn lampFog(dir: vec3f, dist: f32) -> vec3f {
+  if (F.night.y <= 0.0 || F.night.z <= 0.0) { return vec3f(0.0); }
+  let lp = lampPos() - F.camPos.xyz;
+  let t0 = dot(lp, dir);
+  let h = max(length(lp - dir * t0), 0.03);
+  let D = min(dist, 3000.0);
+  let I = (atan((D - t0) / h) + atan(t0 / h)) / h;
+  return LAMP_COL * (F.night.y * F.lamp.w * F.night.z * I * 0.04);
+}
 `;
 
 // Rogue wave: a single steep Gerstner wave group (one giant crest between deep troughs)

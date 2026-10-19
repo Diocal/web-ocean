@@ -69,8 +69,8 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 export const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f, r: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
-// r: time (s), rain amount, lightning flash, rain slant
+struct P { p: vec4f, q: vec4f, r: vec4f, s: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+// r: time (s), rain amount, lightning flash, rain slant; s: night grade, film grain, -, -
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -143,6 +143,14 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
     c += vec3f(0.06, 0.065, 0.075) * (0.6 + lumIn * 2.0 + U.r.z * 4.0) * rain(in.uv, dims.x / dims.y) * U.r.y;
   }
   c *= U.p.x;
+  // night vision (Purkinje shift): dim light loses its colour and turns blue-grey; the
+  // lantern-lit areas keep their warmth
+  if (U.s.x > 0.0) {
+    let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+    let scot = vec3f(l) * vec3f(0.62, 0.78, 1.05);
+    let warm = smoothstep(0.08, 0.45, (c.r - c.b) / max(l, 1e-5)) * smoothstep(0.015, 0.12, l);
+    c = mix(c, scot, U.s.x * 0.9 * (1.0 - smoothstep(0.03, 0.5, l)) * (1.0 - warm));
+  }
   // subtle vignette
   let d = (in.uv - 0.5) * vec2f(dims.x / dims.y, 1.0);
   c *= 1.0 - U.p.w * dot(d, d);
@@ -156,6 +164,11 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   // triangular dither against banding in the sky gradients
   let n = ign(in.pos.xy + U.p.z * 5.588238) + ign(in.pos.xy * 1.37 + 17.0 + U.p.z * 3.1) - 1.0;
   o += n / 255.0;
+  // film grain (stronger in the dark)
+  if (U.s.y > 0.0) {
+    let g = hash21(in.pos.xy + fract(U.r.x * 7.13) * 911.0) - 0.5;
+    o += g * U.s.y * (1.0 - smoothstep(0.0, 0.6, dot(o, vec3f(0.333))));
+  }
   return vec4f(clamp(o, vec3f(0.0), vec3f(1.0)), 1.0);
 }
 `;

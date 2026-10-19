@@ -41,6 +41,9 @@ export const P = {
   rain: 0.0,
   lightning: 0.0,      // strikes per ~8 s
   rogueHeight: 32,     // m crest to trough
+  night: 0,            // 0 day .. 1 moonlit night (stars, night grade)
+  lamp: 0,             // hand-held lantern intensity
+  seaFog: 0,           // sea fog density (1/m)
 };
 // Scene presets: the original sunset; "after the storm" (default): a huge leftover sea under
 // a low golden sun breaking through the clouds, with rogue waves; and a full storm.
@@ -55,6 +58,12 @@ const SCENES = {
     ...P, windSpeed: 16, fetchKm: 400, swellHs: 4.0, swellDir: 104, swellLength: 170, swellSpread: 30, choppy: 1.05,
     turbidity: 0.9, foam: 1.5, sunElev: 4.0, exposure: 1.9, haze: 7.0, clouds: 0.95, veil: 0.95, bloom: 0.14,
     overcast: 0.8, rain: 0.8, lightning: 1.0,
+  },
+  // the ghost ship: a still, moonlit night in a thick sea fog
+  night: {
+    ...P, windSpeed: 5, fetchKm: 200, swellHs: 1.3, swellDir: 104, swellLength: 150, swellSpread: 40, choppy: 1.1,
+    turbidity: 0.7, foam: 0.7, sunElev: 32, sunAzim: 25, exposure: 1.6, haze: 4.0, clouds: 0.45, veil: 0.3, bloom: 0.16,
+    overcast: 0, rain: 0, lightning: 0, rogueHeight: 0, night: 1, lamp: 2, seaFog: 0.012,
   },
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
@@ -84,7 +93,36 @@ function mat4Mul(out, a, b) {
   }
 }
 
+// VR: the same voyage rebuilt for WebXR in three.js (js/vr/vr.js), loaded on demand
+async function loadVR() {
+  return import(new URL('js/vr/vr.js', document.baseURI).href);
+}
+let vrApp = null;
+async function bootVROnly() {
+  document.body.dataset.mode = 'title';
+  document.getElementById('hud').style.display = 'none';
+  document.getElementById('c').style.display = 'none';
+  const bVR = document.getElementById('bVR');
+  document.getElementById('bStart').hidden = true;
+  document.getElementById('bFree').hidden = true;
+  document.querySelector('#intro .keys').textContent = 'Put on your headset, then press Enter VR';
+  bVR.hidden = false;
+  bVR.disabled = true;
+  const { startVR } = await loadVR();
+  // ?vr=flat&vrplay: play the VR version on a flat screen (drag to look, WASD, Q/E tiller)
+  const flatPlay = new URLSearchParams(location.search).has('vrplay');
+  vrApp = await startVR({ immersive: !flatPlay });
+  if (flatPlay) document.body.dataset.mode = 'vr';
+  bVR.disabled = false;
+  bVR.addEventListener('click', () => {
+    vrApp.enterVR().then(() => { document.body.dataset.mode = 'vr'; }).catch((e) => {
+      document.querySelector('#intro .keys').textContent = 'Could not enter VR: ' + (e.message || e);
+    });
+  });
+}
+
 async function main() {
+  if (window.__vrOnly) return bootVROnly();
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
@@ -220,7 +258,7 @@ async function main() {
   });
   // Ships: poses (buoyancy) are simulated on the GPU and stay there
   // (also STORAGE: the rider pass writes the camera into it while you are aboard)
-  const frameUBO = mkBuf(448, GU.UNIFORM | GU.STORAGE | GU.COPY_DST, 'frame ubo');
+  const frameUBO = mkBuf(480, GU.UNIFORM | GU.STORAGE | GU.COPY_DST, 'frame ubo');
   const shipBuf = mkBuf(144 * MAX_SHIPS, GU.STORAGE, 'ship state');
   const shipUBO = mkBuf(320, GU.UNIFORM | GU.COPY_DST, 'ship ubo');
   const shipF = new Float32Array(80);
@@ -390,8 +428,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const BLOOM_LEVELS = 8;
   const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-  const compUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
-  const compData = new Float32Array(12);
+  const compUBO = mkBuf(64, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
+  const compData = new Float32Array(16);
   const bloomUBOs = [];
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
@@ -474,7 +512,7 @@ async function main() {
   // Uniform data
   // --------------------------------------------------------------------------------------
   const simF = new Float32Array(56);
-  const frameF = new Float32Array(112);
+  const frameF = new Float32Array(120);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -918,6 +956,8 @@ async function main() {
   // Per-frame uniforms
   // --------------------------------------------------------------------------------------
   let simTime = Number(qs.get('t')) || 0;
+  // hand-held lantern (offset from the eye; flicker multiplies its intensity)
+  const lamp = { x: 0.28, y: -0.32, z: 0.45, flicker: 1 };
   let flash = 0;
   let frameIndex = 0;
 
@@ -965,6 +1005,12 @@ async function main() {
     f[103] = Math.min(1.6, 0.68 / Math.max(ROGUE_K * rogue.amp, 1e-3));
     f[104] = 120; f[105] = 520;
     f[108] = flash; f[109] = strike.az; f[110] = P.overcast; f[111] = P.rain;
+    // night: the "sun" becomes the moon (same size in the sky, ~1/70 of the light here, the
+    // rest is the night grade), the lantern, and a sea fog
+    f[35] = 14.0 * (1 - 0.985 * P.night);
+    f[91] = Math.max(1.1e-4, P.seaFog);
+    f[112] = P.night; f[113] = P.lamp; f[114] = P.seaFog; f[115] = 0;
+    f[116] = lamp.x; f[117] = lamp.y; f[118] = lamp.z; f[119] = lamp.flicker;
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -1031,7 +1077,7 @@ async function main() {
   }
   addEventListener('keydown', (e) => {
     if (e.code === 'KeyG') triggerRogue();
-    if (e.code === 'KeyT') applyScene({ swell: 'storm', storm: 'sunset', sunset: 'swell' }[sceneName]);
+    if (e.code === 'KeyT') applyScene({ swell: 'storm', storm: 'night', night: 'sunset', sunset: 'swell' }[sceneName]);
   });
   // calm sunset for the voyage; the big "after the storm" sea when flying free
   applyScene(SCENES[qs.get('scene')] ? qs.get('scene') : mode === 'free' ? 'swell' : 'sunset');
@@ -1051,6 +1097,21 @@ async function main() {
   document.getElementById('bFree').addEventListener('click', () => { setMode('free'); lockPointer(); });
   document.getElementById('bResume').addEventListener('click', () => { document.body.classList.remove('paused'); lockPointer(); });
   document.getElementById('bTitle').addEventListener('click', () => location.reload());
+  // PC with a headset (Link / SteamVR): offer the VR version next to the WebGPU one
+  const bVR = document.getElementById('bVR');
+  navigator.xr?.isSessionSupported('immersive-vr').then((ok) => {
+    if (!ok) return;
+    bVR.hidden = false;
+    loadVR();   // warm the module so the click can open the session right away
+  }).catch(() => {});
+  bVR.addEventListener('click', async () => {
+    const { startVR } = await loadVR();
+    vrApp = await startVR({ immersive: true });
+    canvas.style.display = 'none';
+    vrApp.enterVR().then(() => { document.body.dataset.mode = 'vr'; }).catch((e) => {
+      document.querySelector('#intro .keys').textContent = 'Could not enter VR: ' + (e.message || e);
+    });
+  });
   document.getElementById('bAgain').addEventListener('click', () => location.reload());
   document.getElementById('bFloat').addEventListener('click', () => { document.body.classList.remove('ended'); lockPointer(); });
   document.addEventListener('pointerlockchange', () => {
@@ -1233,6 +1294,7 @@ async function main() {
 
   function frame(now) {
     if (shooting) return;  // paused while a screenshot is read back
+    if (vrApp) return;     // handed over to the VR version
     requestAnimationFrame(frame);
     resize();
     let dt = Math.min(0.1, (now - last) / 1000);
@@ -1356,6 +1418,8 @@ async function main() {
     compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 0;
     compData[8] = simTime; compData[9] = P.rain; compData[10] = flash * (0.4 + 0.6 * P.overcast);
     compData[11] = -Math.sin(P.windDir * D2R - cam.yaw) * 0.12 * Math.min(1, P.windSpeed / 15);
+    compData[12] = P.night; compData[13] = P.night * 0.05;
+    if (P.night > 0) compData[3] = 0.10 + 0.22 * P.night;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();

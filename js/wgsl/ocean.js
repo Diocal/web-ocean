@@ -1,5 +1,5 @@
 // Ocean surface + sky background rendering.
-import { FRAME_WGSL, ATMO_CORE_WGSL, ROGUE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, ROGUE_WGSL, LAMP_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
 import { SHIP_SHAPE_WGSL, SHIP_RAY_WGSL } from './boat.js';
 
@@ -12,8 +12,21 @@ const RENDER_BINDINGS = /* wgsl */ `
 
 // Full-resolution sky + clouds. Cloud silhouettes are anti-aliased analytically: the
 // screen-space derivative of each layer's edge function sets the width of its opacity edge.
-export const SKY_BG = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
+export const SKY_BG = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + LAMP_WGSL + /* wgsl */ `
 struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
+// night sky: one jittered star per lit cell of a grid wrapped around the view sphere
+fn stars(dir: vec3f, pixAng: f32) -> vec3f {
+  let c = floor(dir * 220.0);
+  let h = fract(sin(dot(c, vec3f(127.1, 311.7, 74.7))) * 43758.5453);
+  if (h < 0.984) { return vec3f(0.0); }
+  let j = vec3f(fract(h * 13.7), fract(h * 71.3), fract(h * 151.9));
+  let sp = normalize(c + 0.2 + 0.6 * j);
+  let d = length(dir - sp);
+  let r = max(pixAng * 0.75, 0.0004);
+  let b = pow(fract(h * 977.0), 4.0);
+  let tint = mix(vec3f(0.75, 0.82, 1.0), vec3f(1.0, 0.86, 0.7), fract(h * 3.3));
+  return tint * (exp(-d * d / (r * r)) * (0.15 + 4.0 * b));
+}
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
   let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
   var o: VO;
@@ -36,6 +49,15 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   var sunT = 1.0;
   let cl = cloudLayers(d2, pixAng, aa, &sunT);
   var L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
+  if (F.night.x > 0.0 && dir.y > 0.0) {
+    L += stars(dir, pixAng) * (F.night.x * F.sunDir.w * 0.12 * (1.0 - cl.a) * smoothstep(0.0, 0.08, dir.y));
+  }
+  // sea fog: the horizon dissolves into it; the lantern glows in it
+  if (F.night.z > 0.0) {
+    let fogT = exp(-F.night.z * 900.0 * (1.0 - smoothstep(0.0, 0.35, dir.y)));
+    L = mix(skyAtmo(normalize(vec3f(dir.x, 0.002, dir.z))), L, fogT);
+  }
+  L += lampFog(dir, 3000.0);
   // lightning: a jagged bolt from the cloud base to the sea
   if (F.storm.x > 0.0) {
     let az = atan2(dir.x, -dir.z);
@@ -66,7 +88,7 @@ export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ 
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
 @group(0) @binding(12) var<storage, read> ships: array<Ship, MAX_SHIPS>;
-` + ROGUE_WGSL + SHIP_SHAPE_WGSL + SHIP_RAY_WGSL + SKY_RENDER_FUNCS + /* wgsl */ `
+` + ROGUE_WGSL + SHIP_SHAPE_WGSL + SHIP_RAY_WGSL + SKY_RENDER_FUNCS + LAMP_WGSL + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
 const TEX_N: f32 = ${N}.0;
@@ -286,7 +308,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let foamAmb = skyHemi * 1.0 + skyN * 0.3;
   let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
   // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
-  let foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
+  var foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
 
   if (F.post.w > 0.5) {
     // debug: r = foam cover, g = clamp(J), b = world foam level-0 weight
@@ -299,6 +321,21 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     return vec4f(fwl.r, fwl.g, fresh, 1.0) * 0.2;
   }
   var col = body * (1.0 - Fr) + refl * Fr + spec;
+  if (F.night.y > 0.0) {
+    // the lantern: its own glitter path on the waves, a little light into the water, lit foam
+    let toL = lampPos() - Pw;
+    let Ll = normalize(toL);
+    let lE = lampE(Pw);
+    let Hl = normalize(V + Ll);
+    let dl = -Hl.xz / max(Hl.y, 1e-3) - sl;
+    let el = (dl.x * dl.x * cov.y + dl.y * dl.y * cov.x - 2.0 * dl.x * dl.y * cov.z) / det;
+    let hl2 = Hl.y * Hl.y;
+    let Dl = exp(-0.5 * el) / (2.0 * PI * sqrt(det)) / max(hl2 * hl2, 1e-6);
+    let Gl = 1.0 / (1.0 + lambdaSmith(V, cov) + lambdaSmith(Ll, cov));
+    col += lE * (fresnelWater(dot(V, Hl)) * Dl * Gl / (4.0 * max(V.y, 0.02))) * step(0.0, Ll.y);
+    col += F.waterCol.rgb * lE * max(Ll.y, 0.0) * 0.6 * (1.0 - Fr);
+    foamLit += foamAlb * lE * max(dot(nrm, Ll), 0.0) * 0.318;
+  }
   col = mix(col, foamLit, foamMask * 0.95);
 
   // ---- aerial perspective ----
@@ -306,7 +343,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
   let hz = normalize(vec3f(-V.x, 0.002, -V.z));
   let fogCol = skyAtmo(hz);
-  col = col * T + fogCol * (1.0 - T);
+  col = col * T + fogCol * (1.0 - T) + lampFog(-V, dist);
   // no water inside the hulls
   if (inAnyHull(Pw, 0.03)) { discard; }
   return vec4f(col, 1.0);
@@ -361,7 +398,7 @@ export const SHIP_RENDER = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wg
 @group(0) @binding(4) var envCube: texture_cube<f32>;
 @group(0) @binding(5) var<storage, read> ships: array<Ship, MAX_SHIPS>;
 @group(0) @binding(6) var<storage, read> sunVis: array<f32, 4>;
-` + SHIP_SHAPE_WGSL + SKY_RENDER_FUNCS + /* wgsl */ `
+` + SHIP_SHAPE_WGSL + SKY_RENDER_FUNCS + LAMP_WGSL + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 
 struct VO {
@@ -588,11 +625,18 @@ fn jollyRoger(p: vec2f) -> f32 {
     let back = textureSampleLevel(envCube, sampC, -n, ENV_MAXMIP - 1.0).rgb;
     col += alb * (sunE * max(-ndl, 0.0) * 0.318 + back * 0.78) * trans;
   }
+  if (F.night.y > 0.0) {
+    let Pw = in.rel + F.camPos.xyz;
+    let Ll = normalize(lampPos() - Pw);
+    let lE = lampE(Pw);
+    col += alb * (1.0 - metal) * lE * max(dot(n, Ll), 0.0) * 0.318 + lE * ggx(n, V, Ll, max(rough, 0.08), f0);
+    if (trans > 0.0) { col += alb * lE * max(-dot(n, Ll), 0.0) * 0.318 * trans; }
+  }
   col += emit;
 
   let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
   let hz = normalize(vec3f(-V.x, max(-V.y, 0.002), -V.z));
-  col = col * T + skyAtmo(hz) * (1.0 - T);
+  col = col * T + skyAtmo(hz) * (1.0 - T) + lampFog(-V, dist);
   return vec4f(col, 1.0);
 }
 `;

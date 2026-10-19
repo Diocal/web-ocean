@@ -45,6 +45,12 @@ const SLOOP = SHIP_TYPES[0];
 const cabinTop = (s) => topY(SLOOP, s) + 0.58 - 0.30 * sstep(0.12, CAB_S1, s);
 const cabinHalfW = (s) => 0.62 * halfBeam(SLOOP, s);
 
+// tiller: from the rudder stock forward to the hand grip (ship-local)
+export const SLOOP_TILLER = {
+  stock: [0, topY(SLOOP, -0.95) + 0.2, -0.475 * SLOOP.L],
+  handle: [0, topY(SLOOP, -0.7) + 0.55, -0.35 * SLOOP.L],
+};
+
 const lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 
 // ---- sloop rig --------------------------------------------------------------------------
@@ -85,7 +91,8 @@ const FLAG_TOP = GAL_MASTS[1].top + 1.2;
 // Materials: 0 hull, 1 deck, 2 cabin, 3 spar, 4 fore-and-aft sail (mirrored to leeward),
 // 5 rail, 6 boom (mirrored), 7 square sail and 8 yard (both braced about the mast at the
 // pivot z), 9 flag, 10 lantern, 11 rigging.
-export function buildShip(type) {
+// opts.tiller = false leaves the sloop's tiller out (VR draws its own, which you can move)
+export function buildShip(type, opts = {}) {
   const H = SHIP_TYPES[type];
   const pos = [], nrm = [], mat = [], piv = [], idx = [];
   function tri(a, b, c) {
@@ -217,7 +224,7 @@ export function buildShip(type) {
     tube(MAST_TOP, [0, topY(H, -1) + 0.05, -0.5 * H.L + 0.15], 0.014, 0.014, 6, 3);
     // rudder stock and tiller (you take the helm at the stern)
     tube([0, topY(H, -0.95) - 0.05, -0.475 * H.L], [0, topY(H, -0.95) + 0.22, -0.475 * H.L], 0.05, 0.05, 8, 3);
-    tube([0, topY(H, -0.95) + 0.2, -0.475 * H.L], [0, topY(H, -0.7) + 0.55, -0.35 * H.L], 0.035, 0.028, 8, 5);
+    if (opts.tiller !== false) tube(SLOOP_TILLER.stock, SLOOP_TILLER.handle, 0.035, 0.028, 8, 5);
     for (const sx of [1, -1]) {
       const plate = [sx * halfBeam(H, MAST_S - 0.05) * 0.94, topY(H, MAST_S - 0.05) + 0.03, MAST_Z - 0.25];
       tube([0, MAST_D + MAST_H * 0.8, MAST_Z], plate, 0.013, 0.013, 6, 3);
