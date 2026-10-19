@@ -215,6 +215,9 @@ export function buildShip(type) {
     tube(BOOM_A, BOOM_B, 0.065, 0.05, 10, 6);
     tube(STEM, FORESTAY_TOP, 0.016, 0.016, 6, 3);
     tube(MAST_TOP, [0, topY(H, -1) + 0.05, -0.5 * H.L + 0.15], 0.014, 0.014, 6, 3);
+    // rudder stock and tiller (you take the helm at the stern)
+    tube([0, topY(H, -0.95) - 0.05, -0.475 * H.L], [0, topY(H, -0.95) + 0.22, -0.475 * H.L], 0.05, 0.05, 8, 3);
+    tube([0, topY(H, -0.95) + 0.2, -0.475 * H.L], [0, topY(H, -0.7) + 0.55, -0.35 * H.L], 0.035, 0.028, 8, 5);
     for (const sx of [1, -1]) {
       const plate = [sx * halfBeam(H, MAST_S - 0.05) * 0.94, topY(H, MAST_S - 0.05) + 0.03, MAST_Z - 0.25];
       tube([0, MAST_D + MAST_H * 0.8, MAST_Z], plate, 0.013, 0.013, 6, 3);
@@ -303,7 +306,7 @@ struct Ship {
   st0:   vec4f,   // physics: offset from the lagrangian position, w = initialised
   st1:   vec4f,   // velocity
   st2:   vec4f,   // pitch, pitch rate, roll, roll rate
-  kind:  vec4f,   // hull type (0 sloop, 1 galleon), sail colour (0 canvas, 1 black), active, flag angle (rad)
+  kind:  vec4f,   // hull type (0 sloop, 1 galleon), sail colour (0 canvas, 1 black), active (2 = dismasted), flag angle (rad)
 };
 
 fn topY(h: Shape, s: f32) -> f32 {
@@ -432,7 +435,8 @@ fn shipRay(i: u32, ro: vec3f, rd: vec3f) -> vec2f {
         cov = max(cov, (1.0 - smoothstep(0.25, 0.5, ms.x)) * step(1e-4, ms.y));
       }
     }
-  } else {
+  } else if (sh.kind.z < 1.5) {
+    // sloop rig (kind.z = 2: dismasted, no rig left)
     let sx = vec3f(sh.right.w, 1.0, 1.0);
     let tm = rayTri(o, d, MAIN_T * sx, MAIN_H * sx, MAIN_C * sx);
     if (tm > 0.0) { best = tm; kind = 1.0; cov = 1.0; }
@@ -483,7 +487,7 @@ struct ShipIn {
   base: vec4f,   // lagrangian x, z, heading (rad), speed (m/s)
   p:    vec4f,   // dt, heel (rad), sail side, reset
   q:    vec4f,   // hull type, sail colour, active, brace (rad)
-  r:    vec4f,   // flag angle (rad), -, -, -
+  r:    vec4f,   // flag angle (rad), sink (m, a capsized hull settles), -, -
 };
 struct ShipU {
   ships: array<ShipIn, MAX_SHIPS>,
@@ -564,12 +568,59 @@ fn main(@builtin(local_invocation_index) i: u32, @builtin(workgroup_id) wg: vec3
   sh.right = vec4f(r0 * cos(ang.z) - u1 * sin(ang.z), si.p.z);
   sh.up = vec4f(u1 * cos(ang.z) + r0 * sin(ang.z), si.base.w);
   sh.fwd = vec4f(f1, vel.y);
-  sh.pos = vec4f(si.base.x + off.x, off.y, si.base.y + off.z, si.q.w);
+  sh.pos = vec4f(si.base.x + off.x, off.y - si.r.y, si.base.y + off.z, si.q.w);
   sh.lag = vec4f(si.base.xy, fw);
   sh.st0 = vec4f(off, 1.0);
   sh.st1 = vec4f(vel, 0.0);
   sh.st2 = ang;
   sh.kind = vec4f(si.q.xyz, si.r.x);
   ships[wg.x] = sh;
+}
+`;
+
+// ---- riding the sloop -------------------------------------------------------------------
+// Walkable surface under a point of the sloop's deck (ship-local metres): the cabin roof
+// inside the trunk, the deck elsewhere; null outside the toe rail or inside the mast.
+export function sloopWalkY(x, z) {
+  const s = z / (0.5 * SLOOP.L);
+  if (s < -0.97 || s > 0.9 || Math.abs(x) > halfBeam(SLOOP, s) - 0.25) return null;
+  if (Math.hypot(x, z - MAST_Z) < 0.35) return null;  // the mast
+  if (s > CAB_S0 && s < CAB_S1 && Math.abs(x) < cabinHalfW(s)) return cabinTop(s);
+  return topY(SLOOP, s);
+}
+
+// Puts the camera on ship 0 from its GPU pose, so the deck never lags behind the view: eye
+// in ship-local metres, look yaw/pitch relative to the bow. Overwrites the camera fields of
+// the frame uniforms (bound here as storage) after SHIP_SIM and before anything is drawn.
+export const RIDER_WGSL = FRAME_WGSL + SHIP_SHAPE_WGSL + /* wgsl */ `
+struct RiderU {
+  eye:  vec4f,   // xyz ship-local eye, w = how much the view follows the hull's pitch/roll (0..1)
+  look: vec4f,   // yaw (rad, + to starboard), pitch (rad), tan(fovX/2), tan(fovY/2)
+  near: vec4f,   // near plane, -, -, -
+};
+@group(0) @binding(0) var<uniform> R: RiderU;
+@group(0) @binding(1) var<storage, read> ships: array<Ship, MAX_SHIPS>;
+@group(0) @binding(2) var<storage, read_write> frame: array<vec4f, 28>;
+
+@compute @workgroup_size(1)
+fn main() {
+  let sh = ships[0];
+  let eye = sh.pos.xyz + sh.right.xyz * R.eye.x + sh.up.xyz * R.eye.y + sh.fwd.xyz * R.eye.z;
+  // the view is partly levelled towards the horizon: easier on the stomach than the full roll
+  let up0 = normalize(mix(vec3f(0.0, 1.0, 0.0), sh.up.xyz, R.eye.w));
+  let fw0 = normalize(sh.fwd.xyz - up0 * dot(sh.fwd.xyz, up0));
+  let rt0 = cross(fw0, up0);
+  let f = cos(R.look.y) * (cos(R.look.x) * fw0 + sin(R.look.x) * rt0) + sin(R.look.y) * up0;
+  let r = normalize(cross(f, up0));
+  let u = cross(r, f);
+  let view = mat4x4f(vec4f(r.x, u.x, -f.x, 0.0), vec4f(r.y, u.y, -f.y, 0.0), vec4f(r.z, u.z, -f.z, 0.0), vec4f(0.0, 0.0, 0.0, 1.0));
+  let proj = mat4x4f(vec4f(1.0 / R.look.z, 0.0, 0.0, 0.0), vec4f(0.0, 1.0 / R.look.w, 0.0, 0.0),
+                     vec4f(0.0, 0.0, 0.0, -1.0), vec4f(0.0, 0.0, R.near.x, 0.0));
+  let vp = proj * view;
+  for (var c = 0; c < 4; c++) { frame[c] = vp[c]; }
+  frame[4] = vec4f(eye, frame[4].w);
+  frame[5] = vec4f(r * R.look.z, 0.0);
+  frame[6] = vec4f(u * R.look.w, 0.0);
+  frame[7] = vec4f(f, 0.0);
 }
 `;

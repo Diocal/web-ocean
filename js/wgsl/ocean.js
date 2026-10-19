@@ -340,6 +340,18 @@ fn main() {
 }
 `;
 
+// Swimming: puts the eye just above the water the probe found under it this frame (a CPU
+// readback lags several frames, and a passing rogue crest would bury the camera).
+export const SWIM_LIFT = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> waterH: array<f32, 4>;
+@group(0) @binding(1) var<storage, read_write> frame: array<vec4f, 28>;
+@compute @workgroup_size(1)
+fn main() {
+  let p = frame[4];
+  frame[4] = vec4f(p.x, waterH[0] + 0.3, p.z, p.w);
+}
+`;
+
 
 // Ships. Sloop: gelcoat hull with boot stripe and antifouling, non-skid deck, teak, tinted
 // windows, aluminium spars. Galleon: planked dark wood, ochre gunport strake with black
@@ -371,6 +383,8 @@ fn rotY(p: vec3f, pivotZ: f32, a: f32) -> vec3f {
   let m = u32(p.w + 0.5);
   var lp = p.xyz;
   var ln = nIn.xyz;
+  // dismasted: the mast, boom, sails and stays are gone (collapsed to a point out of sight)
+  if (sh.kind.z > 1.5 && (m == 4u || m == 6u || (m == 3u && lp.y > 1.7))) { lp = vec3f(0.0, -60.0, 0.0); }
   if (m == 4u || m == 6u) {
     // fore-and-aft sails and boom swing to leeward (a gybe flattens them through the centreline)
     let sd = sh.right.w;

@@ -5,8 +5,8 @@
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
-import { OCEAN, SKY_BG, HEIGHT_PROBE, SHIP_RENDER } from './wgsl/ocean.js';
-import { SHIP_SIM, SHIP_TYPES, MAX_SHIPS, buildShip } from './wgsl/boat.js';
+import { OCEAN, SKY_BG, HEIGHT_PROBE, SWIM_LIFT, SHIP_RENDER } from './wgsl/ocean.js';
+import { SHIP_SIM, SHIP_TYPES, MAX_SHIPS, buildShip, sloopWalkY, RIDER_WGSL } from './wgsl/boat.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 
 const qs = new URLSearchParams(location.search);
@@ -144,7 +144,7 @@ async function main() {
   const fullArr = (t) => t.createView({ dimension: '2d-array' });
 
   const [initPipe, evolvePipe, rowsPipe, colsPipe, simMipPipe, foamGenPipe, rgba8MipPipe,
-    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe, shipSimPipe] = await Promise.all([
+    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe, shipSimPipe, riderPipe] = await Promise.all([
     computePipe(SIM_INIT, 'sim init'),
     computePipe(SIM_EVOLVE, 'sim evolve'),
     computePipe(FFT_ROWS, 'fft rows'),
@@ -161,6 +161,7 @@ async function main() {
     computePipe(ARRAY16_MIPS, 'array16 mips'),
     computePipe(SUN_VIS, 'sun visibility'),
     computePipe(SHIP_SIM, 'ship sim'),
+    computePipe(RIDER_WGSL, 'rider'),
   ]);
 
   const bg = (pipe, entries, label) => device.createBindGroup({
@@ -218,11 +219,15 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat',
   });
   // Ships: poses (buoyancy) are simulated on the GPU and stay there
-  const frameUBO = mkBuf(448, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  // (also STORAGE: the rider pass writes the camera into it while you are aboard)
+  const frameUBO = mkBuf(448, GU.UNIFORM | GU.STORAGE | GU.COPY_DST, 'frame ubo');
   const shipBuf = mkBuf(144 * MAX_SHIPS, GU.STORAGE, 'ship state');
   const shipUBO = mkBuf(320, GU.UNIFORM | GU.COPY_DST, 'ship ubo');
   const shipF = new Float32Array(80);
   const bgShipSim = bg(shipSimPipe, [{ buffer: shipUBO }, fullArr(dispTex), samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'ship sim');
+  const riderUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'rider ubo');
+  const riderF = new Float32Array(12);
+  const bgRider = bg(riderPipe, [{ buffer: riderUBO }, { buffer: shipBuf }, { buffer: frameUBO }], 'rider');
   const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
     fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim, { buffer: shipBuf }, { buffer: frameUBO }], 'foamupd' + i));
   const bgFoamMips = [0, 1].map((i) => {
@@ -347,6 +352,8 @@ async function main() {
   const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
   const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
   const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
+  const swimPipe = await computePipe(SWIM_LIFT, 'swim lift');
+  const bgSwim = bg(swimPipe, [{ buffer: probeOut }, { buffer: frameUBO }], 'swim');
   let probePending = false, waterH = 0;
   const onProbe = () => {
     waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
@@ -501,22 +508,81 @@ async function main() {
   addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  // (the promise rejects when the page may not lock the pointer, e.g. an automated tab)
+  const lockPointer = () => { try { canvas.requestPointerLock()?.catch?.(() => {}); } catch (e) { /* not allowed here */ } };
+  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) lockPointer(); });
   let dragging = false;
   canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   addEventListener('mousemove', (e) => {
+    if (mode === 'title') return;
+    const look = mode === 'ride' ? ride : cam;
     if (document.pointerLockElement === canvas || dragging) {
-      cam.yaw += e.movementX * 0.0022;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
+      look.yaw += e.movementX * 0.0022;
+      look.pitch = Math.max(-1.5, Math.min(1.5, look.pitch - e.movementY * 0.0022));
     }
   });
   addEventListener('wheel', (e) => {
     cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
   }, { passive: true });
 
+  // --------------------------------------------------------------------------------------
+  // Modes: 'title' (start screen, the camera circles the sloop), 'ride' (aboard the sloop in
+  // first person: walk the deck, the view moves with the hull) and 'free' (fly anywhere; also
+  // whenever a filming/camera parameter is in the URL or after "Free roam").
+  // --------------------------------------------------------------------------------------
+  let mode = ['cam', 'follow', 'film', 'rec', 'free'].some((k) => qs.has(k)) || qs.get('ui') === '0' ? 'free' : 'title';
+  // eye in ship-local metres (x starboard, z towards the bow), look relative to the bow
+  const ride = { x: 0.35, z: -3.9, ey: 0, yaw: 0.25, pitch: -0.08, walked: 0 };
+  const titleCam = { a: 2.2 };
+  function rideCamera(dt) {
+    const sh = FLEET[0];
+    const fwd = helm.on ? 0 : (keys.KeyW || keys.ArrowUp ? 1 : 0) - (keys.KeyS || keys.ArrowDown ? 1 : 0);
+    const str = helm.on ? 0 : (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+    const v = (keys.ShiftLeft || keys.ShiftRight ? 2.6 : 1.4) * dt;
+    const sy = Math.sin(ride.yaw), cy = Math.cos(ride.yaw);
+    const dx = (fwd * sy + str * cy) * v, dz = (fwd * cy - str * sy) * v;
+    // slide along the rail and the cabin sides instead of stopping dead
+    for (const [mx, mz] of [[dx, dz], [dx, 0], [0, dz]]) {
+      if ((mx || mz) && sloopWalkY(ride.x + mx, ride.z + mz) !== null) { ride.x += mx; ride.z += mz; ride.walked += Math.hypot(mx, mz); break; }
+    }
+    const eyeT = sloopWalkY(ride.x, ride.z) + 1.62;
+    ride.ey = ride.ey ? ride.ey + (eyeT - ride.ey) * Math.min(1, dt * 8) : eyeT;
+    const tanY = Math.tan(cam.fovY * 0.5);
+    riderF[0] = ride.x; riderF[1] = ride.ey; riderF[2] = ride.z; riderF[3] = 0.7;
+    riderF[4] = ride.yaw; riderF[5] = ride.pitch; riderF[6] = tanY * W / H; riderF[7] = tanY;
+    riderF[8] = 0.05;
+    device.queue.writeBuffer(riderUBO, 0, riderF);
+    // CPU estimate of the same view (LOD selection, foam clipmaps, audio); the GPU pose wins
+    if (sh && sh.x !== undefined) {
+      const rx = Math.cos(sh.head), rz = Math.sin(sh.head), fx = Math.sin(sh.head), fz = -Math.cos(sh.head);
+      cam.x = sh.x + rx * ride.x + fx * ride.z; cam.z = sh.z + rz * ride.x + fz * ride.z;
+      cam.y = ride.ey; cam.yaw = sh.head + ride.yaw; cam.pitch = ride.pitch;
+    }
+  }
+  // in the water after the capsize: swim slowly, the eye rides just above the surface
+  function swimCamera(dt) {
+    const fwd = (keys.KeyW || keys.ArrowUp ? 1 : 0) - (keys.KeyS || keys.ArrowDown ? 1 : 0);
+    const str = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+    const v = 0.7 * dt, sy = Math.sin(cam.yaw), cy = Math.cos(cam.yaw);
+    cam.x += (fwd * sy + str * cy) * v; cam.z += (-fwd * cy + str * sy) * v;
+    cam.y += (waterH + 0.3 - cam.y) * Math.min(1, dt * 6);
+  }
+  function orbitCamera(dt) {
+    const sh = FLEET[0];
+    if (!sh || sh.x === undefined) return;
+    titleCam.a += dt * 0.045;
+    const R = 34, dx = Math.sin(titleCam.a) * R, dz = Math.cos(titleCam.a) * R;
+    cam.x = sh.x + dx; cam.z = sh.z + dz;
+    cam.y += (Math.max(7, waterH + 4) - cam.y) * Math.min(1, dt * 2);
+    cam.yaw = Math.atan2(-dx, dz);
+    cam.pitch = Math.atan2(5 - cam.y, R);
+  }
   function updateCamera(dt) {
+    if (mode === 'ride') { rideCamera(dt); return; }
+    if (mode === 'title') { orbitCamera(dt); return; }
+    if (mode === 'swim') { swimCamera(dt); return; }
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
     let mx = 0, my = 0, mz = 0;
     const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
@@ -546,30 +612,92 @@ async function main() {
   const fleet = { cx: 0, cz: -330, theta: Math.PI / 2 - 0.10, reset: 1 };
   if (qs.get('boatAt')) fleet.theta = Number(qs.get('boatAt')) * D2R;
   for (const sh of FLEET) { sh.side = 0; sh.brace = 0; }
+  // Once you board (helm.free), the ships sail on their own headings instead of the circle:
+  // the sloop answers the tiller (or a gentle autopilot turn until you first steer) and slows
+  // when pointed into the wind; the galleons chase stations astern of it, turning slowly,
+  // until the rogue wave knocks it down, then sail on into the storm.
+  const helm = { free: false, on: false, rudder: 0, steered: false, capsize: -1, roll: 0, sink: 0, dismast: false };
+  const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const wrapPi = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+  const windRel = (head) => {
+    const wx = Math.cos(P.windDir * D2R), wz = Math.sin(P.windDir * D2R);
+    // wind direction relative to the bow (positive = blowing towards starboard)
+    return Math.atan2(wx * Math.cos(head) + wz * Math.sin(head), wx * Math.sin(head) - wz * Math.cos(head));
+  };
+  function freeFleet() {
+    const omega = P.boatSpeed / 220;
+    FLEET.forEach((sh) => {
+      const th = fleet.theta + sh.dth;
+      sh.x = fleet.cx + sh.r * Math.cos(th); sh.z = fleet.cz + sh.r * Math.sin(th);
+      sh.head = th + Math.PI; sh.v = omega * sh.r;
+    });
+    helm.free = true;
+  }
+  function sailFleet(dt) {
+    const sl = FLEET[0];
+    if (helm.capsize >= 0) {
+      // dismasted: no way on, she drifts to leeward faster than you can swim
+      sl.v += (0 - sl.v) * Math.min(1, dt * 0.8);
+      const drift = 1.1 * smooth(2, 6, helm.capsize) * dt;
+      sl.x += Math.cos(P.windDir * D2R) * drift; sl.z += Math.sin(P.windDir * D2R) * drift;
+    } else {
+      helm.rudder += ((helm.on ? (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) : 0) - helm.rudder) * Math.min(1, dt * 3);
+      if (helm.on && Math.abs(helm.rudder) > 0.2) helm.steered = true;
+      const turn = helm.steered ? helm.rudder * 0.16 : P.boatSpeed / 220;
+      sl.head += turn * Math.min(1, sl.v / 1.5) * dt;
+      // no-go zone: within ~40 deg of the wind the sails luff and she stops
+      const vT = P.boatSpeed * (1 - 0.85 * smooth(2.1, 2.7, Math.abs(windRel(sl.head))));
+      sl.v += (vT - sl.v) * Math.min(1, dt * 0.4);
+    }
+    const fx = Math.sin(sl.head), fz = -Math.cos(sl.head), rx = Math.cos(sl.head), rz = Math.sin(sl.head);
+    FLEET.forEach((sh, i) => {
+      if (i > 0 && helm.capsize < 0) {
+        const back = 45 + 40 * (i - 1), side = i === 1 ? -22 : 26;
+        const tx = sl.x - fx * back + rx * side, tz = sl.z - fz * back + rz * side;
+        const d = Math.hypot(tx - sh.x, tz - sh.z);
+        const want = Math.atan2(tx - sh.x, -(tz - sh.z));
+        sh.head += Math.max(-0.06 * dt, Math.min(0.06 * dt, wrapPi(want - sh.head)));
+        const vT = Math.max(1.0, Math.min(6.5, sl.v + (d - 10) * 0.05));
+        sh.v += (vT - sh.v) * Math.min(1, dt * 0.3);
+      } else if (i > 0) {
+        // the chase is over: bear away from the wreck and run on before the storm
+        const dx = sh.x - sl.x, dz = sh.z - sl.z;
+        if (Math.hypot(dx, dz) < 120) {
+          const away = Math.atan2(dx, -dz);
+          sh.head += Math.max(-0.08 * dt, Math.min(0.08 * dt, wrapPi(away - sh.head)));
+        }
+        sh.v += (P.boatSpeed * 1.3 - sh.v) * Math.min(1, dt * 0.2);
+      }
+      sh.x += Math.sin(sh.head) * sh.v * dt; sh.z += -Math.cos(sh.head) * sh.v * dt;
+    });
+  }
   function updateFleet(dt) {
     const omega = P.boatSpeed / 220;
-    fleet.theta += omega * dt;
-    const wx = Math.cos(P.windDir * D2R), wz = Math.sin(P.windDir * D2R);
+    if (helm.free) sailFleet(dt);
+    else fleet.theta += omega * dt;
     shipF.fill(0);
     FLEET.forEach((sh, i) => {
-      const th = fleet.theta + sh.dth;
-      const head = th + Math.PI;
-      const fx = Math.sin(head), fz = -Math.cos(head), rx = Math.cos(head), rz = Math.sin(head);
-      // wind direction relative to the bow (positive = blowing towards starboard)
-      const rel = Math.atan2(wx * rx + wz * rz, wx * fx + wz * fz);
+      if (!helm.free) {
+        const th = fleet.theta + sh.dth;
+        sh.x = fleet.cx + sh.r * Math.cos(th); sh.z = fleet.cz + sh.r * Math.sin(th);
+        sh.head = th + Math.PI; sh.v = omega * sh.r;
+      }
+      const head = sh.head;
+      const rel = windRel(head);
       const lee = rel >= 0 ? 1 : -1;
       if (!sh.side) sh.side = lee;
       sh.side += (lee - sh.side) * Math.min(1, dt * 0.6);
       const braceT = Math.max(-0.55, Math.min(0.55, Math.abs(rel) > Math.PI / 2 ? rel - Math.PI * lee : rel));
       sh.brace += (braceT - sh.brace) * Math.min(1, dt * 0.5);
       const o = i * 16;
-      shipF[o] = fleet.cx + sh.r * Math.cos(th); shipF[o + 1] = fleet.cz + sh.r * Math.sin(th);
-      sh.x = shipF[o]; sh.z = shipF[o + 1]; sh.head = head;
-      shipF[o + 2] = head; shipF[o + 3] = omega * sh.r;
+      shipF[o] = sh.x; shipF[o + 1] = sh.z;
+      shipF[o + 2] = head; shipF[o + 3] = sh.v;
       shipF[o + 4] = dt;
-      shipF[o + 5] = sh.heel * D2R * sh.side * Math.min(1, P.boatSpeed / 3) * Math.min(1.5, P.windSpeed / 7);
+      shipF[o + 5] = sh.heel * D2R * sh.side * Math.min(1, sh.v / 3) * Math.min(1.5, P.windSpeed / 7);
+      if (i === 0) { shipF[o + 5] += helm.roll * (sh.side < 0 ? -1 : 1); shipF[o + 13] = helm.sink; }
+      shipF[o + 10] = i === 0 && helm.dismast ? 2 : 1;
       shipF[o + 6] = sh.side; shipF[o + 7] = fleet.reset;
-      shipF[o + 8] = sh.type; shipF[o + 9] = sh.sail; shipF[o + 10] = 1; shipF[o + 11] = sh.brace;
+      shipF[o + 8] = sh.type; shipF[o + 9] = sh.sail; shipF[o + 11] = sh.brace;
       shipF[o + 12] = rel + Math.PI;
     });
     for (let c = 0; c < C; c++) { shipF[64 + c] = CASC_L[c]; shipF[72 + c] = 1 / CASC_L[c]; }
@@ -795,7 +923,7 @@ async function main() {
 
   function writeFrame(time) {
     const aspect = W / H;
-    const tanY = Math.tan(cam.fovY * 0.5), tanX = tanY * aspect;
+    const tanY = Math.tan(cam.fovY * 0.5) * (mode === 'ride' ? 1.4 : 1), tanX = tanY * aspect;
     const near = 0.05;
     proj.fill(0);
     proj[0] = 1 / tanX; proj[5] = 1 / tanY; proj[11] = -1; proj[14] = near;
@@ -905,7 +1033,125 @@ async function main() {
     if (e.code === 'KeyG') triggerRogue();
     if (e.code === 'KeyT') applyScene({ swell: 'storm', storm: 'sunset', sunset: 'swell' }[sceneName]);
   });
-  applyScene(SCENES[qs.get('scene')] ? qs.get('scene') : 'swell');
+  // calm sunset for the voyage; the big "after the storm" sea when flying free
+  applyScene(SCENES[qs.get('scene')] ? qs.get('scene') : mode === 'free' ? 'swell' : 'sunset');
+
+  // start screen, pause menu and the first-boarding tutorial
+  const hint = document.getElementById('hint');
+  let hintT = 0;
+  function setMode(m) { mode = m; document.body.dataset.mode = m; document.body.classList.remove('paused'); }
+  setMode(mode);
+  document.getElementById('bStart').addEventListener('click', () => {
+    if (!V.on) { V.on = true; freeFleet(); }
+    setMode('ride');
+    ride.ey = 0;
+    if (!hintT) { hint.classList.add('on'); hintT = 0.001; }
+    lockPointer();
+  });
+  document.getElementById('bFree').addEventListener('click', () => { setMode('free'); lockPointer(); });
+  document.getElementById('bResume').addEventListener('click', () => { document.body.classList.remove('paused'); lockPointer(); });
+  document.getElementById('bTitle').addEventListener('click', () => location.reload());
+  document.getElementById('bAgain').addEventListener('click', () => location.reload());
+  document.getElementById('bFloat').addEventListener('click', () => { document.body.classList.remove('ended'); lockPointer(); });
+  document.addEventListener('pointerlockchange', () => {
+    if ((mode === 'ride' || mode === 'swim') && !V.ended && document.pointerLockElement !== canvas) document.body.classList.add('paused');
+  });
+  addEventListener('keydown', (e) => {
+    if (e.code === 'KeyE' && mode === 'ride' && helm.capsize < 0 && (helm.on || ride.z < -3.2)) helm.on = !helm.on;
+  });
+  // --------------------------------------------------------------------------------------
+  // The voyage (from "Start"): calm sunset, the storm builds, a rogue wave breaks over the
+  // sloop, knocks her flat and dismasts her, and sweeps you overboard; she rights herself
+  // on her keel and drifts away without you. ?vt=s skips ahead.
+  // --------------------------------------------------------------------------------------
+  const V = { on: false, t: Number(qs.get('vt')) || 0, s: -1, respec: 0, rogue: false, faded: false, swimT: -1, ended: false, cap: 0 };
+  const CAPTIONS = [
+    [3, 'Heading into the sunset. Two pirate galleons astern.'],
+    [18, 'Go aft and press E to take the helm.'],
+    [45, 'The wind is shifting…'],
+    [85, 'A storm is coming.'],
+  ];
+  const BLEND = Object.keys(SCENES.storm).filter((k) => k !== 'boatSpeed' && k !== 'rogueHeight' && k !== 'lightning');
+  const capEl = document.getElementById('cap'), promptEl = document.getElementById('prompt'), fadeEl = document.getElementById('fade');
+  let capHide = 0;
+  function caption(text) {
+    capEl.textContent = text; capEl.style.opacity = '1';
+    clearTimeout(capHide); capHide = setTimeout(() => { capEl.style.opacity = '0'; }, 5000);
+  }
+  function setPrompt(text) { if (promptEl.textContent !== text) promptEl.textContent = text; }
+  // test hook: window.__ov exposes the voyage state
+  window.__ov = { helm, V, ride, cam, rogue, FLEET, get mode() { return mode; } };
+  function updateVoyage(dt) {
+    if (!V.on) return;
+    if (!document.body.classList.contains('paused')) V.t += dt;
+    while (V.cap < CAPTIONS.length && V.t >= CAPTIONS[V.cap][0]) caption(CAPTIONS[V.cap++][1]);
+    // the storm builds over ~70 s (spectrum, sky and clouds re-derived a few times a second)
+    const sT = smooth(40, 110, V.t);
+    V.respec -= dt;
+    if (V.respec <= 0 && Math.abs(sT - V.s) > 1e-4) {
+      V.s = sT; V.respec = 0.25;
+      const A = SCENES.sunset, B = SCENES.storm;
+      for (const k of BLEND) P[k] = A[k] + (B[k] - A[k]) * sT;
+      P.lightning = B.lightning * smooth(0.6, 1, sT);
+      needSpectrum = true; needLUT = true; envFull = Math.max(envFull, 1);
+    }
+    // the rogue wave is aimed at the sloop
+    const sl = FLEET[0];
+    if (!V.rogue && V.t > 112) {
+      V.rogue = true;
+      triggerRogue();
+      rogue.u = -320; rogue.ox = sl.x; rogue.oz = sl.z;
+      caption('Something huge is rising behind you…');
+    }
+    if (V.rogue && helm.capsize < 0 && rogue.on) {
+      const us = (sl.x - rogue.ox) * rogue.dx + (sl.z - rogue.oz) * rogue.dz;
+      if (rogue.u > us - 6) { helm.capsize = 0; helm.on = false; }
+    }
+    // knockdown: laid flat with the mast in the sea (which snaps it), then the keel brings
+    // her back upright; you are washed off the deck, under water for a moment, and surface
+    // a dozen metres away
+    if (helm.capsize >= 0) {
+      helm.capsize += dt;
+      const c = helm.capsize;
+      helm.roll = 1.65 * smooth(0.1, 1.4, c) * (1 - smooth(3.4, 8, c));
+      helm.sink = 0.45 * smooth(0.3, 1.5, c) * (1 - smooth(4, 8, c));
+      if (c > 1.5) helm.dismast = true;
+      if (c > 1.0 && !V.faded) { V.faded = true; fadeEl.style.background = '#021016'; fadeEl.style.opacity = '1'; thunder(0); }
+      if (c > 2.6 && mode === 'ride') {
+        const wx = Math.cos(P.windDir * D2R), wz = Math.sin(P.windDir * D2R);
+        // abeam of the wind and a little to windward, so she drifts off past you
+        cam.x = sl.x - wz * 13 - wx * 4; cam.z = sl.z + wx * 13 - wz * 4; cam.y = waterH + 0.3;
+        cam.yaw = Math.atan2(sl.x - cam.x, -(sl.z - cam.z)); cam.pitch = 0.04;
+        setMode('swim');
+        V.swimT = 0;
+        fadeEl.style.transition = 'opacity 2.5s'; fadeEl.style.opacity = '0';
+        caption('You were swept overboard.');
+      }
+    }
+    if (mode === 'swim' && !V.ended && !document.body.classList.contains('paused')) {
+      V.swimT += dt;
+      if (V.swimT - dt < 14 && V.swimT >= 14) caption('Your boat is drifting away without you.');
+      if (V.swimT > 45) { V.ended = true; document.body.classList.add('ended'); document.exitPointerLock(); }
+    }
+    // helm prompt
+    let pr = '';
+    if (mode === 'ride' && helm.capsize < 0) {
+      if (helm.on) pr = 'A / D to steer · E to let go';
+      else if (ride.z < -3.2) pr = 'Press E to take the helm';
+    }
+    setPrompt(pr);
+    promptEl.style.display = pr ? 'block' : 'none';
+  }
+
+  // the tutorial fades once you have walked a few steps (or after 20 s)
+  function updateHint(dt) {
+    if (!hintT || mode !== 'ride' || document.body.classList.contains('paused')) return;
+    hintT += dt;
+    if ((ride.walked > 3 || hintT > 20) && hint.style.opacity !== '0') {
+      hint.style.opacity = '0';
+      setTimeout(() => hint.classList.remove('on'), 1000);
+    }
+  }
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
@@ -945,6 +1191,11 @@ async function main() {
       cp.setPipeline(shipSimPipe);
       cp.setBindGroup(0, bgShipSim);
       cp.dispatchWorkgroups(MAX_SHIPS);
+      if (mode === 'ride') {
+        cp.setPipeline(riderPipe);
+        cp.setBindGroup(0, bgRider);
+        cp.dispatchWorkgroups(1);
+      }
     }
     // foam clipmaps
     foamCur = 1 - foamCur;
@@ -995,6 +1246,8 @@ async function main() {
     }
     if (fixedDt) dt = fixedDt;
     updateCamera(dt);
+    updateHint(dt);
+    updateVoyage(dt);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
@@ -1037,6 +1290,11 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
+    if (mode === 'swim') {
+      cp.setPipeline(swimPipe);
+      cp.setBindGroup(0, bgSwim);
+      cp.dispatchWorkgroups(1);
+    }
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
@@ -1108,7 +1366,7 @@ async function main() {
     pc.end();
 
     let doProbe = false;
-    if (!probePending && ((frameIndex & 7) === 0 || filmN)) {
+    if (!probePending && ((frameIndex & 7) === 0 || filmN || mode === 'swim')) {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
       doProbe = true;
     }
